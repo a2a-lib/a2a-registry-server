@@ -1,11 +1,11 @@
-FROM node:24-alpine AS ui-build
+FROM node:24-alpine3.24 AS ui-build
 WORKDIR /app/ui
 COPY ui/package.json ui/package-lock.json ./
 RUN npm ci
 COPY ui/ ./
 RUN npm run build
 
-FROM node:24-alpine AS server-build
+FROM node:24-alpine3.24 AS server-build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -13,7 +13,7 @@ COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build && npm prune --omit=dev
 
-FROM node:24-alpine AS runtime
+FROM node:24-alpine3.24 AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
 RUN addgroup -S registry && adduser -S registry -G registry

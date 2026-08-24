@@ -92,6 +92,7 @@ For production, enable etcd authentication and TLS, use a least-privilege etcd i
 - Healthcheck: `GET /health/ready`
 - Web dashboard: enabled by default in the image
 - Runtime: non-root user
+- Base image: Node.js 24 LTS on Alpine Linux 3.24
 - Architectures: `linux/amd64` and `linux/arm64`
 
 Available tags include:
