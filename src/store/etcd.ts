@@ -139,6 +139,25 @@ export class EtcdRegistryStore implements RegistryStore {
     await this.replaceLease(agent);
   }
 
+  /** Update a record while retaining its current etcd lease and expiry. */
+  async update(agent: StoredAgent): Promise<void> {
+    if (!agent.backendLeaseId || !agent.backendRevision) {
+      await this.put(agent);
+      return;
+    }
+    const key = base64(this.key(agent.id, agent.instanceId));
+    const response = await this.request<EtcdTransactionResponse>("/v3/kv/txn", {
+      compare: [{ key, target: "MOD", mod_revision: agent.backendRevision, result: "EQUAL" }],
+      success: [{ request_put: { key, value: base64(JSON.stringify(agent)), lease: agent.backendLeaseId } }],
+      failure: [],
+    });
+    if (!response.succeeded) {
+      throw new RegistryError(409, "registration_conflict", "The registration changed concurrently; retry the health update");
+    }
+    const revision = response.responses?.[0]?.response_put?.header?.revision;
+    if (revision) agent.backendRevision = revision;
+  }
+
   /** Renew an agent lease in etcd by replacing the lease with a fresh TTL grant. */
   async renew(agent: StoredAgent): Promise<void> {
     // The JSON gateway's keepalive API is streaming. Replacing the lease keeps
@@ -245,4 +264,3 @@ export class EtcdRegistryStore implements RegistryStore {
     }
   }
 }
-

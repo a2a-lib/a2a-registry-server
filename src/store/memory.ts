@@ -64,6 +64,11 @@ export class MemoryRegistryStore implements RegistryStore {
     this.#agents.set(this.key(agent.id, agent.instanceId), structuredClone(agent));
   }
 
+  /** Update an agent record without changing its in-memory lease semantics. */
+  async update(agent: StoredAgent): Promise<void> {
+    this.#agents.set(this.key(agent.id, agent.instanceId), structuredClone(agent));
+  }
+
   /** Renew an existing agent instance lease record. */
   async renew(agent: StoredAgent): Promise<void> {
     this.#agents.set(this.key(agent.id, agent.instanceId), structuredClone(agent));
@@ -91,4 +96,3 @@ export class MemoryRegistryStore implements RegistryStore {
     }
   }
 }
-

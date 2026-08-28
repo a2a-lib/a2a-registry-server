@@ -3,6 +3,35 @@ import type { AgentCard } from "@a2a-js/sdk";
 /** Generic JSON object type. */
 export type JsonObject = Record<string, unknown>;
 
+/** Protocols supported by the built-in active health checker. */
+export type HealthCheckProtocol = "http" | "tcp";
+
+/** Optional active probe configuration attached to one runtime instance. */
+export interface HealthCheckConfig {
+  /** Probe protocol. HTTP checks use the instance endpoint; TCP checks use its host and port. */
+  protocol: HealthCheckProtocol;
+  /** Optional HTTP path override. */
+  path?: string;
+  /** Seconds between probes. */
+  intervalSeconds?: number;
+  /** Per-probe timeout in seconds. */
+  timeoutSeconds?: number;
+}
+
+/** Latest result from an active health probe. */
+export interface HealthStatus {
+  /** passing for a successful probe, warning for a non-success HTTP response, or critical on failure. */
+  status: "unknown" | "passing" | "warning" | "critical";
+  /** ISO 8601 timestamp of the last completed probe. */
+  checkedAt?: string;
+  /** Probe round-trip time in milliseconds. */
+  latencyMs?: number;
+  /** Number of consecutive non-passing probes. */
+  consecutiveFailures: number;
+  /** Optional status code or transport error summary. */
+  error?: string;
+}
+
 /** One independently leased runtime instance of a logical agent. */
 export interface AgentInstance {
   /** Unique identifier of the instance. */
@@ -21,6 +50,10 @@ export interface AgentInstance {
   expiresAt: string;
   /** Key-value metadata associated with this instance. */
   metadata: Record<string, string>;
+  /** Optional server-side active health probe configuration. */
+  healthCheck?: HealthCheckConfig;
+  /** Latest server-side active health probe result. */
+  health?: HealthStatus;
   /** Monotonically increasing revision number for state tracking. */
   revision: number;
 }
@@ -89,6 +122,8 @@ export interface RegistrationInput {
   ttlSeconds?: number;
   /** Optional key-value metadata. */
   metadata?: Record<string, string>;
+  /** Optional server-side active health probe configuration. */
+  healthCheck?: HealthCheckConfig;
 }
 
 /** Filter criteria for searching and querying agents in discovery listings. */
@@ -122,7 +157,7 @@ export interface AgentPage {
 }
 
 /** Lifecycle event types emitted by the registry. */
-export type RegistryEventType = "registered" | "updated" | "heartbeat" | "unregistered" | "expired";
+export type RegistryEventType = "registered" | "updated" | "heartbeat" | "health_changed" | "unregistered" | "expired";
 
 /** Event representing a state change in the agent registry. */
 export interface RegistryEvent {
@@ -152,6 +187,8 @@ export interface RegistryStore {
   list(): Promise<StoredAgent[]>;
   /** Insert or overwrite a stored agent instance record. */
   put(agent: StoredAgent): Promise<void>;
+  /** Update a stored record without extending its backend lease. */
+  update(agent: StoredAgent): Promise<void>;
   /** Renew the lease for an existing stored agent instance record. */
   renew(agent: StoredAgent): Promise<void>;
   /** Delete a stored agent instance record. */
@@ -163,4 +200,3 @@ export interface Clock {
   /** Returns current timestamp in milliseconds since Unix epoch. */
   now(): number;
 }
-

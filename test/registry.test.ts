@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
+import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { AgentCard } from "@a2a-js/sdk";
 import { createRegistryHttpServer } from "../src/http.js";
@@ -17,6 +18,22 @@ const card = {
   defaultOutputModes: ["application/json"],
   skills: [{ id: "forecast", name: "Weather forecast", description: "Forecast by city", tags: ["weather"] }],
 } as unknown as AgentCard;
+
+async function readSseEvent(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<Record<string, unknown>> {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const chunk = await reader.read();
+    buffer += decoder.decode(chunk.value ?? new Uint8Array(), { stream: !chunk.done });
+    const end = buffer.indexOf("\n\n");
+    if (end >= 0) {
+      const block = buffer.slice(0, end);
+      const data = block.split(/\r?\n/u).find((line) => line.startsWith("data:"));
+      if (data) return JSON.parse(data.slice("data:".length).trim()) as Record<string, unknown>;
+    }
+    if (chunk.done) throw new Error("SSE stream ended before an event was received");
+  }
+}
 
 describe("registry HTTP API", () => {
   const store = new MemoryRegistryStore(1000);
@@ -236,6 +253,78 @@ describe("registry HTTP API", () => {
     assert.ok(etag);
     const cached = await fetch(`${baseUrl}/v1/agents`, { headers: { "if-none-match": etag } });
     assert.equal(cached.status, 304);
+  });
+
+  it("streams an initial snapshot and subsequent revision changes", async () => {
+    const controller = new AbortController();
+    const response = await fetch(`${baseUrl}/v1/watch`, { signal: controller.signal });
+    assert.equal(response.status, 200);
+    const reader = response.body?.getReader();
+    assert.ok(reader);
+    const initial = await readSseEvent(reader);
+    assert.equal(initial.type, "snapshot");
+    const initialRevision = Number(initial.revision);
+
+    const registration = await fetch(`${baseUrl}/v1/agents`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: "watched", endpoint: "https://watched.example/a2a", agentCard: card }),
+    });
+    assert.equal(registration.status, 201);
+    const changed = await readSseEvent(reader);
+    assert.equal(changed.type, "registered");
+    assert.ok(Number(changed.revision) > initialRevision);
+    assert.equal((changed.agents as Array<{ id: string }>).some((agent) => agent.id === "watched"), true);
+    controller.abort();
+    await reader.cancel().catch(() => undefined);
+  });
+});
+
+describe("active health checks", () => {
+  it("records passing and critical HTTP probe results without extending the lease", async () => {
+    let status = 200;
+    const probe = createServer((_req, res) => {
+      res.writeHead(status);
+      res.end();
+    });
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const port = (probe.address() as AddressInfo).port;
+    const service = new RegistryService(new MemoryRegistryStore(), {
+      defaultTtlSeconds: 10,
+      minTtlSeconds: 1,
+      maxTtlSeconds: 60,
+      healthCheckIntervalMs: 10,
+    });
+    await service.start();
+    try {
+      const result = await service.register({
+        id: "health-checked",
+        endpoint: `http://127.0.0.1:${port}/a2a`,
+        agentCard: card,
+        ttlSeconds: 10,
+        healthCheck: { protocol: "http", path: "/health", intervalSeconds: 1, timeoutSeconds: 1 },
+      });
+      assert.equal(result.instance.health?.status, "unknown");
+      const originalExpiry = result.instance.expiresAt;
+      let instance = await service.getInstance("health-checked", result.instance.instanceId);
+      for (let attempt = 0; attempt < 80 && instance.health?.status !== "passing"; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        instance = await service.getInstance("health-checked", result.instance.instanceId);
+      }
+      assert.equal(instance.health?.status, "passing");
+      assert.equal(instance.expiresAt, originalExpiry);
+
+      status = 500;
+      for (let attempt = 0; attempt < 80 && instance.health?.status !== "critical"; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        instance = await service.getInstance("health-checked", result.instance.instanceId);
+      }
+      assert.equal(instance.health?.status, "critical");
+      assert.ok((instance.health?.consecutiveFailures ?? 0) > 0);
+    } finally {
+      await service.stop();
+      await new Promise<void>((resolve, reject) => probe.close((error) => error ? reject(error) : resolve()));
+    }
   });
 });
 

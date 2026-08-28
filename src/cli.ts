@@ -279,6 +279,7 @@ export async function startRegistryServer(
     defaultTtlSeconds: config.defaultTtlSeconds,
     minTtlSeconds: config.minTtlSeconds,
     maxTtlSeconds: config.maxTtlSeconds,
+    healthCheckIntervalMs: config.healthCheckIntervalMs,
   });
   await service.start();
   const server = createRegistryHttpServer(service, config, logger);

@@ -27,8 +27,13 @@ export type {
   AgentInstance,
   AgentPage,
   AgentQuery,
+  HealthCheckConfig,
+  HealthCheckProtocol,
+  HealthStatus,
   RegisteredAgent,
   RegistrationInput,
   RegistryStore,
   StoredAgent,
+  RegistryEvent,
+  RegistryEventType,
 } from "./types.js";

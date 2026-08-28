@@ -25,6 +25,8 @@ export interface RegistryConfig {
   maxTtlSeconds: number;
   /** Interval in milliseconds for the memory store to prune expired leases. */
   pruneIntervalMs: number;
+  /** Scheduler tick in milliseconds for active health checks. */
+  healthCheckIntervalMs: number;
   /** Maximum allowed size in bytes for incoming HTTP request JSON bodies. */
   maxBodyBytes: number;
   /** Origin value returned in Access-Control-Allow-Origin response headers. */
@@ -61,6 +63,7 @@ export interface RegistryConfigOverrides {
   minTtlSeconds?: number;
   maxTtlSeconds?: number;
   pruneIntervalMs?: number;
+  healthCheckIntervalMs?: number;
   maxBodyBytes?: number;
   corsOrigin?: string;
   ui?: boolean;
@@ -191,6 +194,7 @@ export function loadConfig(
     minTtlSeconds,
     maxTtlSeconds,
     pruneIntervalMs: integer("REGISTRY_PRUNE_INTERVAL_MS", 5000, 100, environment, overrides.pruneIntervalMs),
+    healthCheckIntervalMs: integer("REGISTRY_HEALTH_CHECK_INTERVAL_MS", 1000, 100, environment, overrides.healthCheckIntervalMs),
     maxBodyBytes: integer("REGISTRY_MAX_BODY_BYTES", 1024 * 1024, 1024, environment, overrides.maxBodyBytes),
     corsOrigin: (overrides.corsOrigin ?? environment.REGISTRY_CORS_ORIGIN ?? "*").trim() || "*",
     ui: boolean("REGISTRY_UI", environment, overrides.ui, "REGISTRY_ENABLE_UI"),

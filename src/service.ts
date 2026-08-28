@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { connect } from "node:net";
 import { isDeepStrictEqual } from "node:util";
 import { RegistryError } from "./errors.js";
 import type {
@@ -6,15 +7,25 @@ import type {
   AgentPage,
   AgentQuery,
   Clock,
+  HealthCheckConfig,
+  HealthStatus,
   JsonObject,
   RegisteredAgent,
   RegistrationInput,
+  RegistryEvent,
+  RegistryEventType,
   RegistryStore,
   StoredAgent,
 } from "./types.js";
 
 /** Default wall-clock implementation using Date.now(). */
 const systemClock: Clock = { now: () => Date.now() };
+
+interface ProbeResult {
+  status: HealthStatus["status"];
+  latencyMs: number;
+  error?: string;
+}
 
 /** Default instance identifier used when an explicit instanceId is not specified. */
 export const DEFAULT_INSTANCE_ID = "default";
@@ -158,7 +169,12 @@ export class RegistryService {
   readonly #defaultTtl: number;
   readonly #minTtl: number;
   readonly #maxTtl: number;
+  readonly #healthCheckIntervalMs: number;
+  readonly #listeners = new Set<(event: RegistryEvent) => void>();
+  readonly #knownInstances = new Map<string, string>();
+  readonly #healthChecksInFlight = new Set<string>();
   #revision: number;
+  #healthCheckTimer?: NodeJS.Timeout;
 
   /**
    * Create a new RegistryService instance.
@@ -169,6 +185,7 @@ export class RegistryService {
     defaultTtlSeconds: number;
     minTtlSeconds: number;
     maxTtlSeconds: number;
+    healthCheckIntervalMs?: number;
     clock?: Clock;
   }) {
     this.#store = store;
@@ -176,6 +193,7 @@ export class RegistryService {
     this.#defaultTtl = options.defaultTtlSeconds;
     this.#minTtl = options.minTtlSeconds;
     this.#maxTtl = options.maxTtlSeconds;
+    this.#healthCheckIntervalMs = options.healthCheckIntervalMs ?? 1000;
     this.#revision = this.#clock.now();
   }
 
@@ -187,11 +205,30 @@ export class RegistryService {
   /** Start the service and underlying store. */
   async start(): Promise<void> {
     await this.#store.start();
+    if (!this.#healthCheckTimer && this.#healthCheckIntervalMs > 0) {
+      this.#healthCheckTimer = setInterval(() => {
+        void this.runHealthChecks().catch(() => undefined);
+      }, this.#healthCheckIntervalMs);
+      this.#healthCheckTimer.unref();
+    }
   }
 
   /** Stop the service and clean up store resources. */
   async stop(): Promise<void> {
+    if (this.#healthCheckTimer) clearInterval(this.#healthCheckTimer);
+    this.#healthCheckTimer = undefined;
     await this.#store.stop();
+  }
+
+  /** Subscribe to registry mutations for long-lived watch connections. */
+  subscribe(listener: (event: RegistryEvent) => void): () => void {
+    this.#listeners.add(listener);
+    return () => this.#listeners.delete(listener);
+  }
+
+  /** Current local revision counter used by watch clients and cache validators. */
+  get revision(): number {
+    return this.#revision;
   }
 
   /** Check if the underlying store is healthy and operational. */
@@ -244,13 +281,19 @@ export class RegistryService {
       lastSeen: now,
       expiresAt: new Date(nowMs + ttlSeconds * 1000).toISOString(),
       metadata: input.metadata ?? existing?.metadata ?? {},
+      ...(input.healthCheck ?? existing?.healthCheck ? { healthCheck: input.healthCheck ?? existing?.healthCheck } : {}),
+      ...(input.healthCheck ?? existing?.healthCheck ? {
+        health: existing?.health ?? { status: "unknown", consecutiveFailures: 0 },
+      } : {}),
       revision: this.nextRevision(),
       leaseTokenHash: existing?.leaseTokenHash ?? hashToken(generatedToken as string),
       ...(existing?.backendLeaseId === undefined ? {} : { backendLeaseId: existing.backendLeaseId }),
       ...(existing?.backendRevision === undefined ? {} : { backendRevision: existing.backendRevision }),
     };
     await this.#store.put(agent);
+    this.#knownInstances.set(this.instanceKey(agent), agent.id);
     const aggregate = logicalAgent([...siblings, agent]);
+    this.publish(existing ? "updated" : "registered", agent.id, agent.revision);
     return {
       agent: aggregate,
       instance: publicInstance(agent),
@@ -285,7 +328,9 @@ export class RegistryService {
     agent.expiresAt = new Date(nowMs + agent.ttlSeconds * 1000).toISOString();
     agent.revision = this.nextRevision();
     await this.#store.renew(agent);
+    this.#knownInstances.set(this.instanceKey(agent), agent.id);
     const records = (await this.#store.list()).filter((candidate) => candidate.id === id);
+    this.publish("heartbeat", id, agent.revision);
     return { agent: logicalAgent(records), instance: publicInstance(agent) };
   }
 
@@ -312,7 +357,17 @@ export class RegistryService {
   /** Query and filter registered agents with pagination support. */
   async list(query: AgentQuery): Promise<AgentPage> {
     const grouped = new Map<string, StoredAgent[]>();
-    for (const instance of await this.#store.list()) {
+    const stored = await this.#store.list();
+    const currentInstances = new Map(stored.map((instance) => [this.instanceKey(instance), instance.id]));
+    for (const [key, id] of this.#knownInstances) {
+      if (!currentInstances.has(key)) {
+        const revision = this.nextRevision();
+        this.publish("expired", id, revision);
+      }
+    }
+    this.#knownInstances.clear();
+    for (const [key, id] of currentInstances) this.#knownInstances.set(key, id);
+    for (const instance of stored) {
       const records = grouped.get(instance.id) ?? [];
       records.push(instance);
       grouped.set(instance.id, records);
@@ -352,7 +407,102 @@ export class RegistryService {
     const agent = await this.#requiredInstance(id, instanceId);
     if (!privileged) this.assertOwner(agent, leaseToken);
     await this.#store.delete(agent);
-    this.nextRevision();
+    this.#knownInstances.delete(this.instanceKey(agent));
+    const revision = this.nextRevision();
+    this.publish("unregistered", id, revision);
+  }
+
+  /** Run due active health probes and persist their results without renewing leases. */
+  private async runHealthChecks(): Promise<void> {
+    const now = Date.now();
+    for (const record of await this.#store.list()) {
+      if (!record.healthCheck) continue;
+      const intervalMs = (record.healthCheck.intervalSeconds ?? 10) * 1000;
+      if (record.health?.checkedAt && Date.parse(record.health.checkedAt) + intervalMs > now) continue;
+      const key = this.instanceKey(record);
+      if (this.#healthChecksInFlight.has(key)) continue;
+      this.#healthChecksInFlight.add(key);
+      void this.checkHealth(record).finally(() => this.#healthChecksInFlight.delete(key));
+    }
+  }
+
+  /** Probe one instance, retaining its TTL lease while writing the result. */
+  private async checkHealth(record: StoredAgent): Promise<void> {
+    const current = await this.#store.get(record.id, record.instanceId);
+    if (!current || current.revision !== record.revision || !current.healthCheck) return;
+    const result = await this.probe(current.endpoint, current.healthCheck);
+    const checkedAt = new Date(Date.now()).toISOString();
+    const consecutiveFailures = result.status === "passing" ? 0 : (current.health?.consecutiveFailures ?? 0) + 1;
+    current.health = {
+      status: result.status,
+      checkedAt,
+      latencyMs: result.latencyMs,
+      consecutiveFailures,
+      ...(result.error ? { error: result.error } : {}),
+    };
+    current.updatedAt = checkedAt;
+    current.revision = this.nextRevision();
+    await this.#store.update(current);
+    this.#knownInstances.set(this.instanceKey(current), current.id);
+    this.publish("health_changed", current.id, current.revision);
+  }
+
+  /** Execute one HTTP or TCP probe with a bounded timeout. */
+  private async probe(endpoint: string, check: HealthCheckConfig): Promise<ProbeResult> {
+    const started = performance.now();
+    const timeoutMs = (check.timeoutSeconds ?? 5) * 1000;
+    try {
+      if (check.protocol === "tcp") {
+        const target = new URL(endpoint);
+        const port = Number(target.port || (target.protocol === "https:" ? 443 : 80));
+        await new Promise<void>((resolve, reject) => {
+          const socket = connect({ host: target.hostname, port });
+          const timer = setTimeout(() => socket.destroy(new Error("probe timeout")), timeoutMs);
+          socket.once("connect", () => { clearTimeout(timer); socket.end(); resolve(); });
+          socket.once("error", (error) => { clearTimeout(timer); reject(error); });
+        });
+        return { status: "passing", latencyMs: Math.round(performance.now() - started) };
+      }
+
+      const target = new URL(endpoint);
+      if (check.path) {
+        target.pathname = check.path;
+        target.search = "";
+      }
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(target, { method: "GET", redirect: "manual", signal: controller.signal });
+        const status = response.status >= 200 && response.status < 300
+          ? "passing"
+          : response.status < 500 ? "warning" : "critical";
+        await response.body?.cancel();
+        return {
+          status,
+          latencyMs: Math.round(performance.now() - started),
+          ...(status === "passing" ? {} : { error: `http_${response.status}` }),
+        };
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch (error) {
+      return {
+        status: "critical",
+        latencyMs: Math.round(performance.now() - started),
+        error: error instanceof Error ? error.message.slice(0, 256) : "probe failed",
+      };
+    }
+  }
+
+  /** Emit a compact mutation event to active watch subscribers. */
+  private publish(type: RegistryEventType, id: string, revision: number): void {
+    const event: RegistryEvent = { type, id, revision, timestamp: new Date().toISOString() };
+    for (const listener of this.#listeners) listener(event);
+  }
+
+  /** Build the stable internal key for one leased instance. */
+  private instanceKey(agent: Pick<StoredAgent, "id" | "instanceId">): string {
+    return `${agent.id}\u0000${agent.instanceId}`;
   }
 
   /** Internal helper to fetch a required stored instance or throw a 404 RegistryError. */
@@ -425,4 +575,3 @@ export class RegistryService {
     return this.#revision;
   }
 }
-

@@ -22,6 +22,8 @@ This project is a registry **for** A2A agents. Its registry REST API is intentio
 - Optional global write bearer token controls who may create registrations
 - Discovery by skill, skill tag, capability, protocol binding, or agent name
 - Cursor pagination, ETags, readiness/liveness probes, Prometheus text metrics
+- Optional active HTTP/TCP health checks with passing, warning, and critical states
+- Revision-resumable Server-Sent Events watch API for local resolver updates
 - In-memory backend for development and an etcd v3 backend for replicated deployments
 - Compatibility aliases for the routes and `ttlMs` field in the original PoC
 - No web framework; runtime dependencies are the official A2A TypeScript SDK and Pino structured logger
@@ -196,6 +198,7 @@ curl -i http://localhost:3003/v1/agents \
   -d '{
     "id": "weather-eu-1",
     "ttlSeconds": 60,
+    "healthCheck": { "protocol": "http", "path": "/health", "intervalSeconds": 10 },
     "metadata": { "region": "eu-west" },
     "agentCard": {
       "name": "Weather Agent",
@@ -269,6 +272,7 @@ Each response has a different `leaseToken`. Heartbeat an instance at `/v1/agents
 |---|---|---|
 | `POST` | `/v1/agents` | Register an instance (server-generated UUID when `instanceId` is omitted) |
 | `GET` | `/v1/agents` | Discover logical agents and active instances |
+| `GET` | `/v1/watch` | Stream revisioned registry snapshots as Server-Sent Events |
 | `GET` | `/v1/agents/{id}` | Fetch one logical agent and its active instances |
 | `POST` | `/v1/agents/{id}/instances` | Register a named instance |
 | `GET` | `/v1/agents/{id}/instances` | List active instances |
@@ -285,6 +289,8 @@ Each response has a different `leaseToken`. Heartbeat an instance at `/v1/agents
 | `GET` | `/openapi.yaml` | OpenAPI 3.1 document |
 
 Discovery accepts `skill`, `tag`, `capability`, `protocolBinding`, `name`, `limit`, and `cursor`. Pagination and `total` count logical agents, and only logical agents with at least one unexpired instance are returned. The top-level instance fields (`endpoint`, TTL, timestamps, and metadata) remain as a compatibility projection of the first active instance, preferring an explicitly named `default` instance; new clients should use `instances`.
+
+An optional `healthCheck` on each registration enables server-side HTTP or TCP probes. HTTP checks use the registration endpoint unless `path` is supplied; TCP checks connect to the endpoint host and port. Health results are returned as `instance.health` and do not extend the agent-driven TTL lease. The SSE watch endpoint sends an initial snapshot unless `after` (or `Last-Event-ID`) is supplied, then emits a new snapshot whenever the registry revision changes.
 
 PoC-compatible aliases remain available at `/v1/registry`, `/v1/registry/register`, `/v1/registry/agents`, and `/v1/registry/heartbeat`. They use the new ownership rules.
 
@@ -303,6 +309,7 @@ PoC-compatible aliases remain available at `/v1/registry`, `/v1/registry/registe
 | `REGISTRY_WRITE_TOKEN` | unset | If set, registrations require `Authorization: Bearer …` |
 | `REGISTRY_CORS_ORIGIN` | `*` | CORS allow-origin value |
 | `REGISTRY_MAX_BODY_BYTES` | `1048576` | Maximum JSON body size |
+| `REGISTRY_HEALTH_CHECK_INTERVAL_MS` | `1000` | Scheduler tick for active health checks |
 | `REGISTRY_UI` / `REGISTRY_ENABLE_UI` | `false` | Serve the built web dashboard |
 | `REGISTRY_UI_DIR` | package `ui/dist` | Static dashboard build directory |
 | `ETCD_ENDPOINT` | `http://localhost:2379` | etcd v3 JSON gateway |
@@ -328,7 +335,7 @@ For production, enable etcd authentication and TLS, use a dedicated least-privil
 - `REGISTRY_WRITE_TOKEN` is an enrollment control; enable it outside trusted development networks.
 - `X-Registry-Lease-Token` proves ownership of one runtime instance. Only its SHA-256 hash is stored.
 - Put TLS and an identity-aware proxy/API gateway in front of the server. A shared write token is not a replacement for OAuth2, workload identity, or mTLS.
-- The server validates structure and URLs but does not fetch an endpoint during registration, avoiding a registration-time SSRF path.
+- Active health checks intentionally fetch or connect to registered endpoints when configured; restrict registration access and network egress to trusted agents to manage SSRF risk.
 - Agent Cards are public discovery metadata. Do not place credentials or internal secrets in them.
 - Signed Agent Cards are preserved but signature verification and trust policy are deployment-specific and are not performed yet.
 
@@ -336,8 +343,8 @@ For production, enable etcd authentication and TLS, use a dedicated least-privil
 
 1. **Identity and policy:** OIDC/mTLS identities, tenant namespaces, RBAC, admission policy, and audit events. Bind the authenticated identity to the registered agent ID.
 2. **Trust:** verify A2A Agent Card JWS signatures, restrict `jku` origins, maintain trusted issuers/keys, and record verification status without modifying the signed card.
-3. **Active health checks:** optional HTTP/TCP/gRPC probes and passing/warning/critical states, similar to Consul. Keep active checks separate from agent-driven TTL heartbeats.
-4. **Watch API:** Server-Sent Events or gRPC streaming over storage revisions so clients can update a local resolver without polling. etcd watches or Consul blocking queries are natural backends.
+3. **Active health checks:** add gRPC health probes and richer check policies; HTTP/TCP probes and passing/warning/critical state reporting are available now and remain separate from TTL heartbeats.
+4. **Watch API:** add a native etcd watch/gRPC stream for lower-latency cross-replica delivery; the current SSE endpoint provides revisioned snapshots and works with both memory and etcd stores.
 5. **Locality-aware resolution:** add first-class zone/region/weight fields, health-aware selection, and optional client-side round-robin helpers. Until then these values can be carried in per-instance metadata.
 6. **Consul adapter:** use Consul sessions/TTL checks and KV/catalog metadata when an organization already operates Consul.
 7. **Operations:** OpenTelemetry traces, labeled/rate metrics with bounded cardinality, rate limiting, quotas, backups, chaos tests, and SLO dashboards.

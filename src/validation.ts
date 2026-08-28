@@ -1,6 +1,6 @@
 import type { AgentCard } from "@a2a-js/sdk";
 import { RegistryError } from "./errors.js";
-import type { AgentQuery, JsonObject, RegistrationInput } from "./types.js";
+import type { AgentQuery, HealthCheckConfig, JsonObject, RegistrationInput } from "./types.js";
 
 /** Regex pattern for valid identifier strings (alphanumeric, dot, underscore, colon, hyphen). */
 const ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/;
@@ -111,6 +111,42 @@ function validateMetadata(value: unknown): Record<string, string> | undefined {
   return result;
 }
 
+/** Validate an optional active health check configuration. */
+function validateHealthCheck(value: unknown): HealthCheckConfig | undefined {
+  if (value === undefined) return undefined;
+  const input = object(value, "healthCheck");
+  const protocol = input.protocol === undefined ? "http" : nonEmptyString(input.protocol, "healthCheck.protocol", 16);
+  if (protocol !== "http" && protocol !== "tcp") {
+    throw new RegistryError(400, "invalid_request", "healthCheck.protocol must be http or tcp");
+  }
+
+  let path: string | undefined;
+  if (input.path !== undefined) {
+    path = nonEmptyString(input.path, "healthCheck.path", 2048);
+    if (!path.startsWith("/") || path.includes("\\") || path.includes("..")) {
+      throw new RegistryError(400, "invalid_request", "healthCheck.path must be an absolute URL path without '..'");
+    }
+  }
+
+  const integerOption = (name: "intervalSeconds" | "timeoutSeconds", minimum: number, maximum: number): number | undefined => {
+    if (input[name] === undefined) return undefined;
+    const result = Number(input[name]);
+    if (!Number.isSafeInteger(result) || result < minimum || result > maximum) {
+      throw new RegistryError(400, "invalid_request", `healthCheck.${name} must be an integer between ${minimum} and ${maximum}`);
+    }
+    return result;
+  };
+  const intervalSeconds = integerOption("intervalSeconds", 1, 3600);
+  const timeoutSeconds = integerOption("timeoutSeconds", 1, 30);
+
+  return {
+    protocol,
+    ...(path === undefined ? {} : { path }),
+    ...(intervalSeconds === undefined ? {} : { intervalSeconds }),
+    ...(timeoutSeconds === undefined ? {} : { timeoutSeconds }),
+  };
+}
+
 /** Parse and validate request body payload into a RegistrationInput structure. */
 export function parseRegistration(value: unknown): RegistrationInput {
   const input = object(value, "request body");
@@ -138,6 +174,7 @@ export function parseRegistration(value: unknown): RegistrationInput {
     agentCard,
     ...(ttlSeconds === undefined ? {} : { ttlSeconds }),
     ...(input.metadata === undefined ? {} : { metadata: validateMetadata(input.metadata) }),
+    ...(input.healthCheck === undefined ? {} : { healthCheck: validateHealthCheck(input.healthCheck) }),
   };
 }
 
@@ -166,4 +203,3 @@ export function parseAgentQuery(url: URL): AgentQuery {
     ...(optionalQuery(url, "cursor", 1024) ? { cursor: optionalQuery(url, "cursor", 1024) } : {}),
   };
 }
-

@@ -63,6 +63,21 @@ paths:
                   total: { type: integer }
                   nextCursor: { type: string }
                   revision: { type: integer }
+  /v1/watch:
+    get:
+      summary: Watch revisioned registry snapshots
+      description: Streams Server-Sent Events. Use after or Last-Event-ID to resume after a known revision.
+      parameters:
+        - name: after
+          in: query
+          schema: { type: integer, minimum: 0 }
+      responses:
+        '200':
+          description: Registry snapshot stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/Problem' }
   /v1/agents/{id}:
     parameters:
       - $ref: '#/components/parameters/AgentId'
@@ -297,6 +312,7 @@ components:
         agentCard: { $ref: '#/components/schemas/AgentCard' }
         ttlSeconds: { type: integer, minimum: 1 }
         metadata: { type: object, additionalProperties: { type: string } }
+        healthCheck: { $ref: '#/components/schemas/HealthCheckConfig' }
     RegisteredAgent:
       type: object
       required: [id, name, agentCard, instances, instanceCount, endpoint, ttlSeconds, registeredAt, updatedAt, lastSeen, expiresAt, metadata, revision]
@@ -326,7 +342,25 @@ components:
         lastSeen: { type: string, format: date-time }
         expiresAt: { type: string, format: date-time }
         metadata: { type: object, additionalProperties: { type: string } }
+        healthCheck: { $ref: '#/components/schemas/HealthCheckConfig' }
+        health: { $ref: '#/components/schemas/HealthStatus' }
         revision: { type: integer }
+    HealthCheckConfig:
+      type: object
+      properties:
+        protocol: { type: string, enum: [http, tcp], default: http }
+        path: { type: string, pattern: '^/[^\\\\]*$' }
+        intervalSeconds: { type: integer, minimum: 1, maximum: 3600, default: 10 }
+        timeoutSeconds: { type: integer, minimum: 1, maximum: 30, default: 5 }
+    HealthStatus:
+      type: object
+      required: [status, consecutiveFailures]
+      properties:
+        status: { type: string, enum: [unknown, passing, warning, critical] }
+        checkedAt: { type: string, format: date-time }
+        latencyMs: { type: integer, minimum: 0 }
+        consecutiveFailures: { type: integer, minimum: 0 }
+        error: { type: string }
     RegistrationResponse:
       type: object
       required: [status, agent, instance]

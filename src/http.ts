@@ -276,8 +276,78 @@ function serverInfo(config: RegistryConfig, service: RegistryService, ready: boo
       liveness: "/health/live",
       readiness: "/health/ready",
       metrics: "/metrics",
+      watch: "/v1/watch",
     },
   };
+}
+
+/** Stream registry snapshots as Server-Sent Events, resumable by revision. */
+async function serveWatch(
+  res: ServerResponse,
+  service: RegistryService,
+  after: number | undefined,
+): Promise<void> {
+  let lastRevision = after ?? -1;
+  let closed = false;
+  let keepAlive: NodeJS.Timeout | undefined;
+  let poller: NodeJS.Timeout | undefined;
+  let resolveClosed!: () => void;
+  const closedPromise = new Promise<void>((resolve) => { resolveClosed = resolve; });
+  let unsubscribe = (): void => undefined;
+  let sendChain = Promise.resolve();
+
+  const close = (): void => {
+    if (closed) return;
+    closed = true;
+    unsubscribe();
+    if (keepAlive) clearInterval(keepAlive);
+    if (poller) clearInterval(poller);
+    resolveClosed();
+  };
+
+  const sendSnapshot = async (eventType: string, force = false): Promise<void> => {
+    if (closed) return;
+    const page = await service.list({ limit: Number.MAX_SAFE_INTEGER });
+    if (!force && page.revision <= lastRevision) return;
+    lastRevision = page.revision;
+    const payload = JSON.stringify({
+      type: eventType,
+      revision: page.revision,
+      agents: page.agents,
+      total: page.total,
+    });
+    res.write(`event: registry\nid: ${page.revision}\ndata: ${payload}\n\n`);
+  };
+
+  const scheduleSnapshot = (eventType: string): void => {
+    sendChain = sendChain.then(() => sendSnapshot(eventType)).catch(() => close());
+  };
+  unsubscribe = service.subscribe((event) => scheduleSnapshot(event.type));
+  res.once("close", close);
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  res.flushHeaders();
+  keepAlive = setInterval(() => {
+    if (!closed) res.write(": keep-alive\n\n");
+  }, 15_000);
+  keepAlive.unref();
+  poller = setInterval(() => {
+    if (!closed) scheduleSnapshot("changed");
+  }, 1_000);
+  poller.unref();
+
+  try {
+    await sendSnapshot("snapshot", after === undefined);
+  } catch {
+    close();
+    if (!res.writableEnded) res.end();
+    return;
+  }
+  await closedPromise;
 }
 
 /**
@@ -328,6 +398,18 @@ export function createRegistryHttpServer(
         const body = await readFile(new URL("../openapi.yaml", import.meta.url), "utf8");
         res.writeHead(200, { "Content-Type": "application/yaml; charset=utf-8" });
         res.end(body);
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/v1/watch") {
+        const rawAfter = url.searchParams.get("after") ?? (Array.isArray(req.headers["last-event-id"])
+          ? req.headers["last-event-id"][0]
+          : req.headers["last-event-id"]);
+        const after = rawAfter === undefined ? undefined : Number(rawAfter);
+        if (after !== undefined && (!Number.isSafeInteger(after) || after < 0)) {
+          throw new RegistryError(400, "invalid_query", "after must be a non-negative integer revision");
+        }
+        await serveWatch(res, service, after);
         return;
       }
 

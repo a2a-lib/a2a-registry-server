@@ -99,4 +99,26 @@ describe("etcd store", () => {
     await assert.rejects(() => store.renew(record), /changed concurrently/);
     assert.ok(paths.includes("/v3/lease/revoke"));
   });
+
+  it("updates health state without extending the existing lease", async () => {
+    const requests: Array<{ path: string; body: Record<string, unknown> }> = [];
+    globalThis.fetch = async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+      requests.push({ path, body });
+      return response({ succeeded: true, responses: [{ response_put: { header: { revision: "8" } } }] });
+    };
+
+    const store = new EtcdRegistryStore({ endpoint: "http://etcd:2379", prefix: "/agents/" });
+    const record = agent();
+    record.backendLeaseId = "101";
+    record.backendRevision = "7";
+    record.health = { status: "passing", consecutiveFailures: 0 };
+    await store.update(record);
+
+    assert.deepEqual(requests.map((request) => request.path), ["/v3/kv/txn"]);
+    const transaction = requests[0]!.body;
+    assert.equal((transaction.success as Array<{ request_put: { lease: string } }>)[0]?.request_put.lease, "101");
+    assert.equal(record.backendRevision, "8");
+  });
 });
