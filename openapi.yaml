@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: A2A Registry API
-  version: 0.2.5
+  version: 0.3.0
   description: Lease-based registration and discovery for logical A2A agents with independently leased runtime instances. This registry API is not an A2A task/message transport.
 servers:
   - url: http://localhost:3003

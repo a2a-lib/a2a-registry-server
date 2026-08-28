@@ -9,14 +9,14 @@ The registry stores A2A Agent Cards, supports TTL heartbeats and ownership token
 Pull and run the latest release:
 
 ```bash
-docker pull digicrafts/a2a-registry:0.2.5
+docker pull digicrafts/a2a-registry:0.3.0
 
 docker run -d \
   --name a2a-registry \
   --restart unless-stopped \
   -p 3003:3003 \
   -e REGISTRY_STORE=memory \
-  digicrafts/a2a-registry:0.2.5
+  digicrafts/a2a-registry:0.3.0
 ```
 
 Open the dashboard at [http://localhost:3003](http://localhost:3003).
@@ -58,7 +58,7 @@ docker run -d \
   -p 3003:3003 \
   -e REGISTRY_STORE=memory \
   -e REGISTRY_WRITE_TOKEN="change-this-token" \
-  digicrafts/a2a-registry:0.2.5
+  digicrafts/a2a-registry:0.3.0
 ```
 
 Clients must then send:
@@ -80,7 +80,7 @@ docker run -d \
   -e ETCD_ENDPOINT=http://etcd:2379 \
   -e ETCD_PREFIX=/a2a-registry/agents/ \
   -e REGISTRY_WRITE_TOKEN="change-this-token" \
-  digicrafts/a2a-registry:0.2.5
+  digicrafts/a2a-registry:0.3.0
 ```
 
 For production, enable etcd authentication and TLS, use a least-privilege etcd identity, and run an odd-sized etcd cluster.
@@ -98,7 +98,7 @@ For production, enable etcd authentication and TLS, use a least-privilege etcd i
 Available tags include:
 
 ```text
-0.2.5
+0.3.0
 latest
 ```
 

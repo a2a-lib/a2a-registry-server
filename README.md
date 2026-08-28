@@ -99,7 +99,7 @@ The registry server is available as the published Docker Hub image [`digicrafts/
 Pull a specific release tag for repeatable deployments:
 
 ```bash
-docker pull digicrafts/a2a-registry:0.2.5
+docker pull digicrafts/a2a-registry:0.3.0
 ```
 
 Run the registry with the in-memory store:
@@ -111,7 +111,7 @@ docker run -d \
   -p 3003:3003 \
   -e REGISTRY_PORT=3003 \
   -e REGISTRY_STORE=memory \
-  digicrafts/a2a-registry:0.2.5
+  digicrafts/a2a-registry:0.3.0
 ```
 
 The `latest` tag is also available, but version tags are recommended for production:
@@ -130,7 +130,7 @@ docker run -d \
   -e REGISTRY_PORT=3003 \
   -e REGISTRY_STORE=memory \
   -e REGISTRY_WRITE_TOKEN=my-secret-token \
-  digicrafts/a2a-registry:0.2.5
+  digicrafts/a2a-registry:0.3.0
 ```
 
 For a distributed deployment, use `REGISTRY_STORE=etcd` and configure `ETCD_ENDPOINT`, `ETCD_PREFIX`, and any required etcd credentials. See [Distributed deployment with etcd](#distributed-deployment-with-etcd).
@@ -171,7 +171,7 @@ docker buildx inspect --bootstrap
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   --pull \
-  -t digicrafts/a2a-registry:0.2.5 \
+  -t digicrafts/a2a-registry:0.3.0 \
   -t digicrafts/a2a-registry:latest \
   --push \
   .

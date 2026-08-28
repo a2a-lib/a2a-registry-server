@@ -1,6 +1,6 @@
 {
   "name": "@a2a-lib/registry-server",
-  "version": "0.2.5",
+  "version": "0.3.0",
   "description": "A lease-based registry and discovery server for A2A agents",
   "type": "module",
   "main": "./dist/index.js",
