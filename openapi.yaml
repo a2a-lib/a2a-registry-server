@@ -78,6 +78,21 @@ paths:
             text/event-stream:
               schema: { type: string }
         '400': { $ref: '#/components/responses/Problem' }
+  /admin/backup:
+    get:
+      summary: Export a public registry backup
+      description: Returns active registrations and operational metadata without lease tokens or backend credentials. Disabled unless a backup bearer token is configured.
+      security:
+        - backupToken: []
+      responses:
+        '200':
+          description: Public registry snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupSnapshot'
+        '401': { $ref: '#/components/responses/Problem' }
+        '404': { $ref: '#/components/responses/Problem' }
   /v1/agents/{id}:
     parameters:
       - $ref: '#/components/parameters/AgentId'
@@ -240,6 +255,9 @@ components:
       type: apiKey
       in: header
       name: X-Registry-Lease-Token
+    backupToken:
+      type: http
+      scheme: bearer
   parameters:
     AgentId:
       name: id
@@ -260,7 +278,7 @@ components:
   schemas:
     ServerInfo:
       type: object
-      required: [name, version, apiVersion, url, status, store, documentation, endpoints]
+      required: [name, version, apiVersion, url, status, store, documentation, endpoints, trust]
       properties:
         name: { type: string }
         version: { type: string }
@@ -270,6 +288,12 @@ components:
         store: { type: string }
         documentation: { type: string, format: uri }
         endpoints: { type: object, additionalProperties: { type: string } }
+        trust:
+          type: object
+          required: [required, statusField]
+          properties:
+            required: { type: boolean }
+            statusField: { type: string, const: agentCardTrust }
     AgentCard:
       type: object
       description: A2A Agent Card. Unknown fields are preserved for forward compatibility.
@@ -288,7 +312,17 @@ components:
               protocolVersion: { type: string }
         capabilities: { type: object, additionalProperties: true }
         skills: { type: array, items: { type: object, additionalProperties: true } }
+        signatures:
+          type: array
+          items: { $ref: '#/components/schemas/AgentCardSignature' }
       additionalProperties: true
+    AgentCardSignature:
+      type: object
+      required: [protected, signature]
+      properties:
+        protected: { type: string, description: Base64url-encoded protected JWS header }
+        signature: { type: string, description: Base64url-encoded JWS signature }
+        header: { type: object, additionalProperties: true }
     RegistrationInput:
       allOf:
         - $ref: '#/components/schemas/RegistrationInputWithoutId'
@@ -315,11 +349,12 @@ components:
         healthCheck: { $ref: '#/components/schemas/HealthCheckConfig' }
     RegisteredAgent:
       type: object
-      required: [id, name, agentCard, instances, instanceCount, endpoint, ttlSeconds, registeredAt, updatedAt, lastSeen, expiresAt, metadata, revision]
+      required: [id, name, agentCard, agentCardTrust, instances, instanceCount, endpoint, ttlSeconds, registeredAt, updatedAt, lastSeen, expiresAt, metadata, revision]
       properties:
         id: { type: string }
         name: { type: string }
         agentCard: { $ref: '#/components/schemas/AgentCard' }
+        agentCardTrust: { $ref: '#/components/schemas/AgentCardTrust' }
         instances: { type: array, minItems: 1, items: { $ref: '#/components/schemas/AgentInstance' } }
         instanceCount: { type: integer, minimum: 1 }
         endpoint: { type: string, format: uri, description: Compatibility projection of the first active instance, preferring an explicitly named default instance. }
@@ -330,6 +365,16 @@ components:
         expiresAt: { type: string, format: date-time }
         metadata: { type: object, additionalProperties: { type: string } }
         revision: { type: integer }
+    AgentCardTrust:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [verified, unverified, invalid] }
+        verifiedAt: { type: string, format: date-time }
+        issuer: { type: string }
+        keyId: { type: string }
+        jku: { type: string, format: uri }
+        reason: { type: string }
     AgentInstance:
       type: object
       required: [instanceId, endpoint, ttlSeconds, registeredAt, updatedAt, lastSeen, expiresAt, metadata, revision]
@@ -361,6 +406,14 @@ components:
         latencyMs: { type: integer, minimum: 0 }
         consecutiveFailures: { type: integer, minimum: 0 }
         error: { type: string }
+    BackupSnapshot:
+      type: object
+      required: [version, generatedAt, revision, agents]
+      properties:
+        version: { type: integer, const: 1 }
+        generatedAt: { type: string, format: date-time }
+        revision: { type: integer }
+        agents: { type: array, items: { $ref: '#/components/schemas/RegisteredAgent' } }
     RegistrationResponse:
       type: object
       required: [status, agent, instance]

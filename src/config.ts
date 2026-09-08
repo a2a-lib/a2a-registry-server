@@ -2,6 +2,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { RegistryError } from "./errors.js";
 import { isLogLevel, LOG_LEVELS, type LogLevel } from "./logger.js";
+import type { JsonObject } from "./types.js";
 
 const DEFAULT_UI_DIR = fileURLToPath(new URL("../ui/dist/", import.meta.url));
 
@@ -37,6 +38,23 @@ export interface RegistryConfig {
   uiDir: string;
   /** Optional bearer token required to authorize agent registrations. */
   writeToken?: string;
+  /** Agent Card signature verification and key trust policy. */
+  trust: {
+    required: boolean;
+    trustedIssuers: string[];
+    trustedJkuOrigins: string[];
+    trustedJwks: JsonObject;
+  };
+  /** Optional bearer token required to export a public registry backup. */
+  backupToken?: string;
+  /** Per-client API request rate limit; zero disables the limiter. */
+  rateLimitRequestsPerMinute: number;
+  /** Maximum burst accepted by the per-client rate limiter. */
+  rateLimitBurst: number;
+  /** Maximum active instances per logical agent; zero means unlimited. */
+  maxInstancesPerAgent: number;
+  /** Maximum active instances in the registry; zero means unlimited. */
+  maxActiveInstances: number;
   /** Configuration options for the etcd storage backend. */
   etcd: {
     /** etcd v3 HTTP JSON gateway endpoint URL. */
@@ -69,6 +87,12 @@ export interface RegistryConfigOverrides {
   ui?: boolean;
   uiDir?: string;
   writeToken?: string;
+  trust?: Partial<RegistryConfig["trust"]>;
+  backupToken?: string;
+  rateLimitRequestsPerMinute?: number;
+  rateLimitBurst?: number;
+  maxInstancesPerAgent?: number;
+  maxActiveInstances?: number;
   etcd?: Partial<RegistryConfig["etcd"]>;
 }
 
@@ -101,6 +125,40 @@ function optional(name: string, environment: NodeJS.ProcessEnv, override?: strin
   const value = override ?? environment[name];
   const normalized = value?.trim();
   return normalized ? normalized : undefined;
+}
+
+/** Parse a comma-separated allowlist and discard empty values. */
+function list(name: string, environment: NodeJS.ProcessEnv, override?: string[]): string[] {
+  const raw = override?.join(",") ?? environment[name] ?? "";
+  return raw.split(",").map((value) => value.trim()).filter(Boolean);
+}
+
+/** Parse a JSON object setting used for a trusted public JWK Set. */
+function jsonObject(name: string, environment: NodeJS.ProcessEnv, override?: JsonObject): JsonObject {
+  if (override !== undefined) return override;
+  const raw = environment[name]?.trim();
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+    return parsed as JsonObject;
+  } catch {
+    throw new RegistryError(500, "invalid_configuration", `${name} must be a JSON object containing a JWK Set`);
+  }
+}
+
+/** Normalize a configured HTTPS origin used to constrain remote JWK Set URLs. */
+function httpsOrigin(value: string, name: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new RegistryError(500, "invalid_configuration", `${name} must contain valid HTTPS origins`);
+  }
+  if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) {
+    throw new RegistryError(500, "invalid_configuration", `${name} must contain HTTPS origins without paths or credentials`);
+  }
+  return parsed.origin;
 }
 
 /** Parse a boolean environment setting while keeping programmatic overrides authoritative. */
@@ -183,6 +241,16 @@ export function loadConfig(
     throw new RegistryError(500, "invalid_configuration", "REGISTRY_UI_DIR must not be empty");
   }
   const uiDir = configuredUiDir === undefined ? DEFAULT_UI_DIR : resolve(configuredUiDir.trim());
+  const configuredJkuOrigins = list("REGISTRY_TRUSTED_JKU_ORIGINS", environment, overrides.trust?.trustedJkuOrigins)
+    .map((origin) => httpsOrigin(origin, "REGISTRY_TRUSTED_JKU_ORIGINS"));
+  const trustedIssuers = list("REGISTRY_TRUSTED_ISSUERS", environment, overrides.trust?.trustedIssuers);
+  const trustedJwks = jsonObject("REGISTRY_TRUSTED_JWKS", environment, overrides.trust?.trustedJwks);
+  const rateLimitRequestsPerMinute = integer(
+    "REGISTRY_RATE_LIMIT_REQUESTS_PER_MINUTE", 600, 0, environment, overrides.rateLimitRequestsPerMinute,
+  );
+  const rateLimitBurst = integer("REGISTRY_RATE_LIMIT_BURST", 60, 1, environment, overrides.rateLimitBurst);
+  const maxInstancesPerAgent = integer("REGISTRY_MAX_INSTANCES_PER_AGENT", 0, 0, environment, overrides.maxInstancesPerAgent);
+  const maxActiveInstances = integer("REGISTRY_MAX_ACTIVE_INSTANCES", 0, 0, environment, overrides.maxActiveInstances);
 
   return {
     host,
@@ -200,6 +268,17 @@ export function loadConfig(
     ui: boolean("REGISTRY_UI", environment, overrides.ui, "REGISTRY_ENABLE_UI"),
     uiDir,
     writeToken: optional("REGISTRY_WRITE_TOKEN", environment, overrides.writeToken),
+    trust: {
+      required: boolean("REGISTRY_TRUST_REQUIRED", environment, overrides.trust?.required),
+      trustedIssuers,
+      trustedJkuOrigins: configuredJkuOrigins,
+      trustedJwks,
+    },
+    backupToken: optional("REGISTRY_BACKUP_TOKEN", environment, overrides.backupToken),
+    rateLimitRequestsPerMinute,
+    rateLimitBurst,
+    maxInstancesPerAgent,
+    maxActiveInstances,
     etcd: {
       endpoint: etcdEndpoint,
       prefix: (overrides.etcd?.prefix ?? environment.ETCD_PREFIX ?? "/a2a-registry/agents/").trim() || "/a2a-registry/agents/",

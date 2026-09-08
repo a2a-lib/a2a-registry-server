@@ -2,7 +2,9 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypt
 import { connect } from "node:net";
 import { isDeepStrictEqual } from "node:util";
 import { RegistryError } from "./errors.js";
+import { AgentCardTrustVerifier } from "./trust.js";
 import type {
+  AgentCardTrust,
   AgentInstance,
   AgentPage,
   AgentQuery,
@@ -48,8 +50,8 @@ function tokenMatches(token: string, expectedHash: string): boolean {
 /** Strip internal storage fields (lease token hashes, backend IDs) to return a public AgentInstance object. */
 function publicInstance(agent: StoredAgent): AgentInstance {
   const {
-    id: _, name: __, agentCard: ___, leaseTokenHash: ____, backendLeaseId: _____,
-    backendRevision: ______, ...result
+    id: _, name: __, agentCard: ___, agentCardTrust: ____, leaseTokenHash: _____, backendLeaseId: ______,
+    backendRevision: _______, ...result
   } = agent;
   return result;
 }
@@ -67,6 +69,7 @@ function logicalAgent(records: StoredAgent[]): RegisteredAgent {
     id: primary.id,
     name: primary.name,
     agentCard: primary.agentCard,
+    agentCardTrust: primary.agentCardTrust ?? { status: "unverified", reason: "trust_status_unavailable" },
     instances,
     instanceCount: instances.length,
     endpoint: primary.endpoint,
@@ -170,6 +173,9 @@ export class RegistryService {
   readonly #minTtl: number;
   readonly #maxTtl: number;
   readonly #healthCheckIntervalMs: number;
+  readonly #trustVerifier?: AgentCardTrustVerifier;
+  readonly #maxInstancesPerAgent: number;
+  readonly #maxActiveInstances: number;
   readonly #listeners = new Set<(event: RegistryEvent) => void>();
   readonly #knownInstances = new Map<string, string>();
   readonly #healthChecksInFlight = new Set<string>();
@@ -186,6 +192,9 @@ export class RegistryService {
     minTtlSeconds: number;
     maxTtlSeconds: number;
     healthCheckIntervalMs?: number;
+    trustVerifier?: AgentCardTrustVerifier;
+    maxInstancesPerAgent?: number;
+    maxActiveInstances?: number;
     clock?: Clock;
   }) {
     this.#store = store;
@@ -194,6 +203,9 @@ export class RegistryService {
     this.#minTtl = options.minTtlSeconds;
     this.#maxTtl = options.maxTtlSeconds;
     this.#healthCheckIntervalMs = options.healthCheckIntervalMs ?? 1000;
+    this.#trustVerifier = options.trustVerifier;
+    this.#maxInstancesPerAgent = options.maxInstancesPerAgent ?? 0;
+    this.#maxActiveInstances = options.maxActiveInstances ?? 0;
     this.#revision = this.#clock.now();
   }
 
@@ -254,7 +266,14 @@ export class RegistryService {
     }
     if (existing && !privileged) this.assertOwner(existing, leaseToken);
 
-    const siblings = (await this.#store.list()).filter((agent) => agent.id === input.id && agent.instanceId !== instanceId);
+    const active = await this.#store.list();
+    const siblings = active.filter((agent) => agent.id === input.id && agent.instanceId !== instanceId);
+    if (!existing && this.#maxInstancesPerAgent > 0 && siblings.length + 1 > this.#maxInstancesPerAgent) {
+      throw new RegistryError(429, "agent_instance_quota_exceeded", `Agent '${input.id}' may have at most ${this.#maxInstancesPerAgent} active instances`);
+    }
+    if (!existing && this.#maxActiveInstances > 0 && active.length + 1 > this.#maxActiveInstances) {
+      throw new RegistryError(429, "registry_instance_quota_exceeded", `The registry may have at most ${this.#maxActiveInstances} active instances`);
+    }
     const sharedCard = siblings[0]?.agentCard;
     if (sharedCard && !isDeepStrictEqual(sharedCard, input.agentCard)) {
       throw new RegistryError(409, "agent_card_mismatch", `All active instances of agent '${input.id}' must publish the same Agent Card`);
@@ -264,6 +283,12 @@ export class RegistryService {
     if (ttlSeconds < this.#minTtl || ttlSeconds > this.#maxTtl) {
       throw new RegistryError(400, "invalid_ttl", `ttlSeconds must be between ${this.#minTtl} and ${this.#maxTtl}`);
     }
+    const agentCardTrust: AgentCardTrust = this.#trustVerifier
+      ? await this.#trustVerifier.enforce(input.agentCard)
+      : {
+        status: "unverified",
+        reason: input.agentCard.signatures?.length ? "trust_policy_not_configured" : "no_signature",
+      };
 
     const nowMs = this.#clock.now();
     const now = new Date(nowMs).toISOString();
@@ -275,6 +300,7 @@ export class RegistryService {
       name: typeof card.name === "string" ? card.name : input.id,
       endpoint: input.endpoint ?? "",
       agentCard: input.agentCard,
+      agentCardTrust,
       ttlSeconds,
       registeredAt: existing?.registeredAt ?? now,
       updatedAt: now,
@@ -387,6 +413,17 @@ export class RegistryService {
     };
   }
 
+  /** Export a public, restorable discovery snapshot without lease secrets or backend credentials. */
+  async exportSnapshot(): Promise<JsonObject> {
+    const page = await this.list({ limit: Number.MAX_SAFE_INTEGER });
+    return {
+      version: 1,
+      generatedAt: new Date(this.#clock.now()).toISOString(),
+      revision: page.revision,
+      agents: page.agents,
+    };
+  }
+
   /** Unregister an agent using compatibility route resolution for default/inferred instance. */
   async unregister(
     id: string,
@@ -422,7 +459,9 @@ export class RegistryService {
       const key = this.instanceKey(record);
       if (this.#healthChecksInFlight.has(key)) continue;
       this.#healthChecksInFlight.add(key);
-      void this.checkHealth(record).finally(() => this.#healthChecksInFlight.delete(key));
+      void this.checkHealth(record)
+        .catch(() => undefined)
+        .finally(() => this.#healthChecksInFlight.delete(key));
     }
   }
 
