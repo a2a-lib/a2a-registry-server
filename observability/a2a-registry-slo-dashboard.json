@@ -1,0 +1,42 @@
+{
+  "title": "A2A Registry SLOs",
+  "uid": "a2a-registry-slo",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Availability",
+      "targets": [{ "expr": "1 - (sum(rate(a2a_registry_http_requests_by_route_total{status_class=~\"4xx|5xx\"}[5m])) / clamp_min(sum(rate(a2a_registry_http_requests_by_route_total[5m])), 1))", "legendFormat": "availability" }],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 } },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "p95 request latency",
+      "targets": [{ "expr": "histogram_quantile(0.95, sum by (le) (rate(a2a_registry_http_request_duration_seconds_bucket[5m])))", "legendFormat": "p95" }],
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Rate limiting",
+      "targets": [{ "expr": "rate(a2a_registry_http_requests_rate_limited_total[5m])", "legendFormat": "limited requests/s" }],
+      "fieldConfig": { "defaults": { "unit": "reqps" } },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Traffic by route",
+      "targets": [{ "expr": "sum by (route, status_class) (rate(a2a_registry_http_requests_by_route_total[5m]))", "legendFormat": "{{route}} {{status_class}}" }],
+      "fieldConfig": { "defaults": { "unit": "reqps" } },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 }
+    }
+  ]
+}

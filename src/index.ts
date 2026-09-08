@@ -23,7 +23,9 @@ export { DEFAULT_INSTANCE_ID, RegistryService } from "./service.js";
 export { SERVER_VERSION } from "./version.js";
 export { EtcdRegistryStore } from "./store/etcd.js";
 export { MemoryRegistryStore } from "./store/memory.js";
+export { AgentCardTrustVerifier, type AgentCardTrustOptions } from "./trust.js";
 export type {
+  AgentCardTrust,
   AgentInstance,
   AgentPage,
   AgentQuery,

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
 import type { AgentCard } from "@a2a-js/sdk";
+import { randomUUID } from "node:crypto";
+import { RegistryService } from "../src/service.js";
 import { EtcdRegistryStore } from "../src/store/etcd.js";
 import type { StoredAgent } from "../src/types.js";
 
@@ -33,6 +35,79 @@ function agent(): StoredAgent {
 }
 
 describe("etcd store", () => {
+  for (const perAgent of [false, true]) {
+    it(`enforces ${perAgent ? "per-agent" : "global"} capacity across etcd replicas`, {
+      skip: !process.env.ETCD_TEST_ENDPOINT,
+    }, async () => {
+      const prefix = `/quota-test/${randomUUID()}/`;
+      const stores = Array.from({ length: 3 }, () => new EtcdRegistryStore({
+        endpoint: process.env.ETCD_TEST_ENDPOINT!, prefix,
+      }));
+      const services = stores.map((store) => new RegistryService(store, {
+        defaultTtlSeconds: 60, minTtlSeconds: 1, maxTtlSeconds: 3600,
+        maxActiveInstances: perAgent ? 0 : 1, maxInstancesPerAgent: perAgent ? 1 : 0,
+      }));
+      const inputs = services.map((_, index) => ({
+        id: perAgent ? "shared" : `agent-${index}`, instanceId: `instance-${index}`,
+        endpoint: "https://example.test/a2a", agentCard: agent().agentCard,
+      }));
+      try {
+        const results = await Promise.allSettled(services.map((service, index) => service.register(inputs[index]!)));
+        assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+        for (const result of results) {
+          if (result.status === "rejected") assert.equal(result.reason.code, perAgent ? "agent_instance_quota_exceeded" : "registry_instance_quota_exceeded");
+        }
+        assert.equal((await stores[0]!.list()).length, 1);
+        const winner = results.findIndex((result) => result.status === "fulfilled");
+        const result = results[winner]!;
+        if (result.status !== "fulfilled") throw new Error("No admission succeeded");
+        await services[winner]!.register(inputs[winner]!, result.value.leaseToken);
+        await services[winner]!.heartbeatInstance(inputs[winner]!.id, inputs[winner]!.instanceId, result.value.leaseToken);
+        await services[winner]!.unregisterInstance(inputs[winner]!.id, inputs[winner]!.instanceId, result.value.leaseToken);
+        await services[0]!.register(inputs[0]!);
+        assert.equal((await stores[0]!.list()).length, 1);
+      } finally {
+        for (const record of await stores[0]!.list()) await stores[0]!.delete(record);
+      }
+    });
+  }
+
+  it("rechecks capacity after a snapshot conflict and revokes the rejected lease", async () => {
+    let reads = 0;
+    let transactions = 0;
+    let revoked = false;
+    globalThis.fetch = async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      if (path === "/v3/lease/grant") return response({ ID: "104" });
+      if (path === "/v3/kv/range") {
+        reads += 1;
+        return response({ header: { revision: reads === 1 ? "9007199254740993" : "9007199254740994" },
+          kvs: reads === 1 ? [] : [{ key: Buffer.from("/agents/other").toString("base64"),
+            value: Buffer.from(JSON.stringify({ ...agent(), id: "other" })).toString("base64") }],
+        });
+      }
+      if (path === "/v3/kv/txn") {
+        transactions += 1;
+        assert.deepEqual(body.compare[1], {
+          key: Buffer.from("/agents/").toString("base64"), range_end: Buffer.from("/agents0").toString("base64"),
+          target: "MOD", result: "LESS", mod_revision: "9007199254740994",
+        });
+        return response({ succeeded: false });
+      }
+      if (path === "/v3/lease/revoke") revoked = body.ID === "104";
+      return response({});
+    };
+    const store = new EtcdRegistryStore({ endpoint: "http://etcd:2379", prefix: "/agents/" });
+    const record = agent();
+    await assert.rejects(() => store.put(record, { maxActiveInstances: 1, maxInstancesPerAgent: 0 }),
+      (error: any) => error.code === "registry_instance_quota_exceeded");
+    assert.equal(reads, 2);
+    assert.equal(transactions, 1);
+    assert.equal(revoked, true);
+    assert.equal(record.backendLeaseId, undefined);
+  });
+
   it("uses a version-zero transaction to prevent duplicate ID claims", async () => {
     const requests: Array<{ path: string; body: Record<string, unknown> }> = [];
     globalThis.fetch = async (input, init) => {
