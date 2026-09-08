@@ -1,5 +1,6 @@
+import { assertInstanceCapacity } from "./quotas.js";
 import { RegistryError } from "../errors.js";
-import type { RegistryStore, StoredAgent } from "../types.js";
+import type { InstanceQuotas, RegistryStore, StoredAgent } from "../types.js";
 
 /** Configuration options for the etcd storage adapter. */
 interface EtcdOptions {
@@ -135,8 +136,8 @@ export class EtcdRegistryStore implements RegistryStore {
   }
 
   /** Save or update a stored agent record attached to an etcd lease. */
-  async put(agent: StoredAgent): Promise<void> {
-    await this.replaceLease(agent);
+  async put(agent: StoredAgent, quotas?: InstanceQuotas): Promise<void> {
+    await this.replaceLease(agent, quotas);
   }
 
   /** Update a record while retaining its current etcd lease and expiry. */
@@ -185,7 +186,7 @@ export class EtcdRegistryStore implements RegistryStore {
   }
 
   /** Helper to grant a new etcd lease and update the key atomically inside a transaction. */
-  private async replaceLease(agent: StoredAgent): Promise<void> {
+  private async replaceLease(agent: StoredAgent, quotas?: InstanceQuotas): Promise<void> {
     const previousLease = agent.backendLeaseId;
     const grant = await this.request<{ ID?: string | number }>("/v3/lease/grant", { TTL: agent.ttlSeconds });
     if (grant.ID === undefined) throw new RegistryError(503, "etcd_lease_failed", "etcd did not grant a lease");
@@ -196,17 +197,38 @@ export class EtcdRegistryStore implements RegistryStore {
       const compare = agent.backendRevision
         ? { key, target: "MOD", mod_revision: agent.backendRevision, result: "EQUAL" }
         : { key, target: "VERSION", version: "0", result: "EQUAL" };
-      const response = await this.request<EtcdTransactionResponse>("/v3/kv/txn", {
-        compare: [compare],
-        success: [{ request_put: { key, value: base64(JSON.stringify(agent)), lease: leaseId } }],
-        failure: [],
-      });
+      let response: EtcdTransactionResponse = {};
+      const enforceQuotas = quotas && (quotas.maxInstancesPerAgent > 0 || quotas.maxActiveInstances > 0);
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        const compares: Record<string, unknown>[] = [compare];
+        if (enforceQuotas) {
+          const snapshot = await this.request<{ header?: { revision?: string }; kvs?: EtcdKeyValue[] }>("/v3/kv/range", {
+            key: base64(this.#prefix), range_end: prefixEnd(this.#prefix),
+          });
+          if (!snapshot.header?.revision) throw new RegistryError(503, "etcd_request_failed", "etcd did not return a snapshot revision");
+          assertInstanceCapacity((snapshot.kvs ?? []).map((entry) => this.decode(entry)), agent, quotas);
+          // Reject any insertion/update after this linearizable snapshot, including
+          // keys absent from the snapshot. Deletions/lease expiry only free capacity.
+          compares.push({
+            key: base64(this.#prefix), range_end: prefixEnd(this.#prefix),
+            target: "MOD", result: "LESS", mod_revision: String(BigInt(snapshot.header.revision) + 1n),
+          });
+        }
+        response = await this.request<EtcdTransactionResponse>("/v3/kv/txn", {
+          compare: compares,
+          success: [{ request_put: { key, value: base64(JSON.stringify(agent)), lease: leaseId } }],
+          failure: [],
+        });
+        if (response.succeeded || !enforceQuotas) break;
+      }
       if (!response.succeeded) {
         throw new RegistryError(409, "registration_conflict", "The registration changed concurrently; fetch it and retry with its current lease token");
       }
       const revision = response.responses?.[0]?.response_put?.header?.revision;
       if (revision) agent.backendRevision = revision;
     } catch (error) {
+      if (previousLease === undefined) delete agent.backendLeaseId;
+      else agent.backendLeaseId = previousLease;
       await this.revoke(leaseId).catch(() => undefined);
       throw error;
     }

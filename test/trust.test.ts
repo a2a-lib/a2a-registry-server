@@ -61,6 +61,44 @@ describe("Agent Card trust policy", () => {
       error instanceof Error && error.message.includes("signature verification failed"));
   });
 
+  it("cancels oversized JWK streams before consuming the rest and does not cache them", async () => {
+    const { privateKey, publicKey } = await generateKeyPair("RS256");
+    const jwk = { ...await exportJWK(publicKey), kid: "remote-key" };
+    const signed = await generateAgentCardSignature(privateKey, {
+      alg: "RS256", kid: "remote-key", typ: "JOSE", jku: "https://trusted.example/keys",
+    })(card);
+    let pulls = 0;
+    let cancelled = false;
+    let fetches = 0;
+    const verifier = new AgentCardTrustVerifier({
+      required: true, trustedIssuers: [], trustedJkuOrigins: ["https://trusted.example"], trustedJwks: {},
+      fetch: async () => {
+        fetches += 1;
+        if (fetches > 1) {
+          // Exactly the limit is accepted, including a UTF-8 character split across chunks.
+          const json = JSON.stringify({ keys: [jwk], note: "é" });
+          const bytes = Buffer.from(json + " ".repeat(256 * 1024 - Buffer.byteLength(json)));
+          const split = bytes.indexOf(Buffer.from("é")) + 1;
+          return new Response(new ReadableStream({ start(controller) {
+            controller.enqueue(bytes.subarray(0, split));
+            controller.enqueue(bytes.subarray(split));
+            controller.close();
+          } }));
+        }
+        return new Response(new ReadableStream<Uint8Array>({
+          pull(controller) { pulls += 1; controller.enqueue(new Uint8Array(64 * 1024)); },
+          cancel() { cancelled = true; },
+        }, { highWaterMark: 0 }), { headers: { "content-length": "1" } });
+      },
+    });
+    await assert.rejects(() => verifier.enforce(signed), /signature verification failed/);
+    assert.equal(cancelled, true);
+    assert.equal(pulls, 5);
+    assert.equal((await verifier.enforce(signed)).status, "verified");
+    assert.equal((await verifier.enforce(signed)).status, "verified");
+    assert.equal(fetches, 2);
+  });
+
   it("persists verification status beside the card and enforces required trust", async () => {
     const { privateKey, publicKey } = await generateKeyPair("RS256");
     const publicJwk = await exportJWK(publicKey);

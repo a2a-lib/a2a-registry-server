@@ -371,6 +371,8 @@ For production, enable etcd authentication and TLS, use a dedicated least-privil
 ```bash
 npm run check
 npm test
+# Include concurrent admission tests against a running etcd v3 gateway:
+ETCD_TEST_ENDPOINT=http://127.0.0.1:2379 npm test
 npm run build
 ```
 

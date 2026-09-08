@@ -33,6 +33,40 @@ describe("operations controls", () => {
     assert.equal(limiter.consume("one", 0).allowed, true);
   });
 
+  for (const perAgent of [false, true]) {
+    it(`atomically admits concurrent registrations under the ${perAgent ? "per-agent" : "global"} quota`, async () => {
+      let now = Date.now();
+      const store = new MemoryRegistryStore(5000, { now: () => now });
+      const services = Array.from({ length: 3 }, () => new RegistryService(store, {
+        defaultTtlSeconds: 60, minTtlSeconds: 1, maxTtlSeconds: 3600,
+        maxActiveInstances: perAgent ? 0 : 1, maxInstancesPerAgent: perAgent ? 1 : 0,
+        clock: { now: () => now },
+      }));
+      const inputs = services.map((_, index) => ({
+        id: perAgent ? "same-agent" : `agent-${index}`, instanceId: `instance-${index}`,
+        endpoint: "https://operations.example/a2a", agentCard: card,
+      }));
+      const results = await Promise.allSettled(services.map((service, index) => service.register(inputs[index]!)));
+      assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+      for (const result of results) {
+        if (result.status === "rejected") assert.equal(result.reason.code, perAgent ? "agent_instance_quota_exceeded" : "registry_instance_quota_exceeded");
+      }
+      assert.equal((await store.list()).length, 1);
+      const winner = results.findIndex((result) => result.status === "fulfilled");
+      const result = results[winner]!;
+      assert.equal(result.status, "fulfilled");
+      if (result.status !== "fulfilled") return;
+      // Updating at capacity must not consume a second slot.
+      await services[winner]!.register(inputs[winner]!, result.value.leaseToken);
+      await services[winner]!.unregisterInstance(inputs[winner]!.id, inputs[winner]!.instanceId, result.value.leaseToken);
+      await services[0]!.register(inputs[0]!);
+      // Expiry releases capacity even before the background prune runs.
+      now += 61_000;
+      await services[1]!.register(inputs[1]!);
+      assert.equal((await store.list()).length, 1);
+    });
+  }
+
   it("enforces active-instance quotas and exports a secret-free backup", async () => {
     const service = new RegistryService(new MemoryRegistryStore(), {
       defaultTtlSeconds: 60,

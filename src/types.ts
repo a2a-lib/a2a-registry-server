@@ -191,6 +191,12 @@ export interface RegistryEvent {
   timestamp: string;
 }
 
+/** Active instance limits; zero disables a limit. */
+export interface InstanceQuotas {
+  maxInstancesPerAgent: number;
+  maxActiveInstances: number;
+}
+
 /** Abstract interface for storage backends (e.g. Memory, etcd). */
 export interface RegistryStore {
   /** Human-readable identifier for the storage backend implementation. */
@@ -205,8 +211,8 @@ export interface RegistryStore {
   get(id: string, instanceId: string): Promise<StoredAgent | undefined>;
   /** List all active agent instances in the store. */
   list(): Promise<StoredAgent[]>;
-  /** Insert or overwrite a stored agent instance record. */
-  put(agent: StoredAgent): Promise<void>;
+  /** Insert or overwrite a record. Enforce supplied quotas atomically with the write, across all store clients. */
+  put(agent: StoredAgent, quotas?: InstanceQuotas): Promise<void>;
   /** Update a stored record without extending its backend lease. */
   update(agent: StoredAgent): Promise<void>;
   /** Renew the lease for an existing stored agent instance record. */

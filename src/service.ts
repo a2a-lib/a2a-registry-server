@@ -268,12 +268,6 @@ export class RegistryService {
 
     const active = await this.#store.list();
     const siblings = active.filter((agent) => agent.id === input.id && agent.instanceId !== instanceId);
-    if (!existing && this.#maxInstancesPerAgent > 0 && siblings.length + 1 > this.#maxInstancesPerAgent) {
-      throw new RegistryError(429, "agent_instance_quota_exceeded", `Agent '${input.id}' may have at most ${this.#maxInstancesPerAgent} active instances`);
-    }
-    if (!existing && this.#maxActiveInstances > 0 && active.length + 1 > this.#maxActiveInstances) {
-      throw new RegistryError(429, "registry_instance_quota_exceeded", `The registry may have at most ${this.#maxActiveInstances} active instances`);
-    }
     const sharedCard = siblings[0]?.agentCard;
     if (sharedCard && !isDeepStrictEqual(sharedCard, input.agentCard)) {
       throw new RegistryError(409, "agent_card_mismatch", `All active instances of agent '${input.id}' must publish the same Agent Card`);
@@ -316,7 +310,10 @@ export class RegistryService {
       ...(existing?.backendLeaseId === undefined ? {} : { backendLeaseId: existing.backendLeaseId }),
       ...(existing?.backendRevision === undefined ? {} : { backendRevision: existing.backendRevision }),
     };
-    await this.#store.put(agent);
+    await this.#store.put(agent, {
+      maxInstancesPerAgent: this.#maxInstancesPerAgent,
+      maxActiveInstances: this.#maxActiveInstances,
+    });
     this.#knownInstances.set(this.instanceKey(agent), agent.id);
     const aggregate = logicalAgent([...siblings, agent]);
     this.publish(existing ? "updated" : "registered", agent.id, agent.revision);

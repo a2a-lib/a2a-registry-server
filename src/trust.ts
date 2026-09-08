@@ -153,8 +153,26 @@ export class AgentCardTrustVerifier {
     try {
       const response = await fetcher(jku, { method: "GET", redirect: "error", signal: controller.signal });
       if (!response.ok) throw new Error("jku fetch failed");
-      const body = await response.text();
-      if (Buffer.byteLength(body, "utf8") > MAX_REMOTE_JWKS_BYTES) throw new Error("jku response too large");
+      if (!response.body) throw new Error("jku response body missing");
+      const reader = response.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let bytes = 0;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          bytes += value.byteLength;
+          if (bytes > MAX_REMOTE_JWKS_BYTES) {
+            controller.abort();
+            await reader.cancel().catch(() => undefined);
+            throw new Error("jku response too large");
+          }
+          chunks.push(value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+      const body = Buffer.concat(chunks, bytes).toString("utf8");
       const parsed = JSON.parse(body) as unknown;
       if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid jwks");
       const keys = keyEntries(parsed as JsonObject);
