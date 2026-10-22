@@ -1,6 +1,6 @@
 {
   "name": "@a2a-lib/registry-server",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "A lease-based registry and discovery server for A2A agents",
   "type": "module",
   "main": "./dist/index.js",
@@ -20,7 +20,7 @@
     "ui/dist/**/*"
   ],
   "engines": {
-    "node": ">=22"
+    "node": "^22.23.4 || ^24.22.1 || ^26.12.1"
   },
   "scripts": {
     "build:ui": "npm --prefix ui run build",

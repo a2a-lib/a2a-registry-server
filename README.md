@@ -30,7 +30,7 @@ This project is a registry **for** A2A agents. Its registry REST API is intentio
 
 ## Quick start
 
-Requirements: Node.js 22 or newer.
+Requirements: Node.js 22.23.4+ (22.x), 24.22.1+ (24.x), or 26.12.1+ (26.x).
 
 Install the package globally via npm:
 
