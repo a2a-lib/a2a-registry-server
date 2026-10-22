@@ -10,6 +10,7 @@ import { loadConfig, type RegistryConfig, type RegistryConfigOverrides } from ".
 import { RegistryError } from "./errors.js";
 import { createLogger, isLogLevel, LOG_LEVELS, type Logger } from "./logger.js";
 import { RegistryService } from "./service.js";
+import { AgentCardTrustVerifier } from "./trust.js";
 import { EtcdRegistryStore } from "./store/etcd.js";
 import { MemoryRegistryStore } from "./store/memory.js";
 import type { Server } from "node:http";
@@ -280,6 +281,9 @@ export async function startRegistryServer(
     minTtlSeconds: config.minTtlSeconds,
     maxTtlSeconds: config.maxTtlSeconds,
     healthCheckIntervalMs: config.healthCheckIntervalMs,
+    trustVerifier: new AgentCardTrustVerifier(config.trust),
+    maxInstancesPerAgent: config.maxInstancesPerAgent,
+    maxActiveInstances: config.maxActiveInstances,
   });
   await service.start();
   const server = createRegistryHttpServer(service, config, logger);

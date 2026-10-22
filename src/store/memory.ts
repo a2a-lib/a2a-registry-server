@@ -1,4 +1,5 @@
-import type { Clock, RegistryStore, StoredAgent } from "../types.js";
+import { assertInstanceCapacity } from "./quotas.js";
+import type { Clock, InstanceQuotas, RegistryStore, StoredAgent } from "../types.js";
 
 /** Default wall clock implementation for MemoryRegistryStore. */
 const systemClock: Clock = { now: () => Date.now() };
@@ -60,7 +61,10 @@ export class MemoryRegistryStore implements RegistryStore {
   }
 
   /** Store or update an agent instance record. */
-  async put(agent: StoredAgent): Promise<void> {
+  async put(agent: StoredAgent, quotas?: InstanceQuotas): Promise<void> {
+    // No await between pruning, admission, and writing: one atomic JS turn.
+    this.prune();
+    assertInstanceCapacity([...this.#agents.values()], agent, quotas);
     this.#agents.set(this.key(agent.id, agent.instanceId), structuredClone(agent));
   }
 

@@ -24,9 +24,11 @@ This project is a registry **for** A2A agents. Its registry REST API is intentio
 - Cursor pagination, ETags, readiness/liveness probes, Prometheus text metrics
 - Optional active HTTP/TCP health checks with passing, warning, and critical states
 - Revision-resumable Server-Sent Events watch API for local resolver updates
+- Optional A2A Agent Card JWS verification with trusted issuers, local JWK Sets, and restricted `jku` origins
+- OpenTelemetry HTTP spans, bounded-label Prometheus metrics, rate limiting, active-instance quotas, and authenticated backups
 - In-memory backend for development and an etcd v3 backend for replicated deployments
 - Compatibility aliases for the routes and `ttlMs` field in the original PoC
-- No web framework; runtime dependencies are the official A2A TypeScript SDK and Pino structured logger
+- No web framework; runtime dependencies are the official A2A TypeScript SDK, JOSE, OpenTelemetry API, and Pino structured logger
 
 ## Quick start
 
@@ -286,11 +288,16 @@ Each response has a different `leaseToken`. Heartbeat an instance at `/v1/agents
 | `GET` | `/health/live` | Process liveness |
 | `GET` | `/health/ready` | Storage readiness |
 | `GET` | `/metrics` | Prometheus text metrics |
+| `GET` | `/admin/backup` | Authenticated public registry snapshot export |
 | `GET` | `/openapi.yaml` | OpenAPI 3.1 document |
 
 Discovery accepts `skill`, `tag`, `capability`, `protocolBinding`, `name`, `limit`, and `cursor`. Pagination and `total` count logical agents, and only logical agents with at least one unexpired instance are returned. The top-level instance fields (`endpoint`, TTL, timestamps, and metadata) remain as a compatibility projection of the first active instance, preferring an explicitly named `default` instance; new clients should use `instances`.
 
 An optional `healthCheck` on each registration enables server-side HTTP or TCP probes. HTTP checks use the registration endpoint unless `path` is supplied; TCP checks connect to the endpoint host and port. Health results are returned as `instance.health` and do not extend the agent-driven TTL lease. The SSE watch endpoint sends an initial snapshot unless `after` (or `Last-Event-ID`) is supplied, then emits a new snapshot whenever the registry revision changes.
+
+When Agent Card trust is enabled, each logical agent includes an `agentCardTrust` status separate from the original `agentCard`. Verification uses the A2A SDK's JCS/JWS implementation and never adds or removes fields in the signed card. `verified` means a signature matched a configured trusted JWK and issuer policy; `unverified` means no signature was present; `invalid` records a rejected signature when enforcement is disabled. Set `REGISTRY_TRUST_REQUIRED=true` to reject unverified or invalid registrations. A `jku` is fetched only over HTTPS when its exact origin is listed in `REGISTRY_TRUSTED_JKU_ORIGINS`.
+
+The `/admin/backup` endpoint exports active public registrations, trust status, health state, and revision metadata without lease tokens or backend credentials. It is disabled unless `REGISTRY_BACKUP_TOKEN` is set and requires that token as a bearer credential. The Prometheus endpoint exposes fixed route/method/status-class counters and duration buckets; request IDs, agent IDs, and arbitrary URLs are never metric labels. HTTP spans use the OpenTelemetry API and become exportable when the hosting process installs an OpenTelemetry SDK/provider.
 
 PoC-compatible aliases remain available at `/v1/registry`, `/v1/registry/register`, `/v1/registry/agents`, and `/v1/registry/heartbeat`. They use the new ownership rules.
 
@@ -310,6 +317,15 @@ PoC-compatible aliases remain available at `/v1/registry`, `/v1/registry/registe
 | `REGISTRY_CORS_ORIGIN` | `*` | CORS allow-origin value |
 | `REGISTRY_MAX_BODY_BYTES` | `1048576` | Maximum JSON body size |
 | `REGISTRY_HEALTH_CHECK_INTERVAL_MS` | `1000` | Scheduler tick for active health checks |
+| `REGISTRY_TRUST_REQUIRED` | `false` | Reject registrations without a trusted Agent Card signature |
+| `REGISTRY_TRUSTED_ISSUERS` | unset | Comma-separated protected-header `iss` allowlist |
+| `REGISTRY_TRUSTED_JKU_ORIGINS` | unset | Comma-separated HTTPS origins allowed for remote JWK Sets |
+| `REGISTRY_TRUSTED_JWKS` | `{}` | JSON JWK Set for locally trusted public keys |
+| `REGISTRY_BACKUP_TOKEN` | unset | Enables `GET /admin/backup` with a bearer token |
+| `REGISTRY_RATE_LIMIT_REQUESTS_PER_MINUTE` | `600` | Per-peer API request refill rate; `0` disables limiting |
+| `REGISTRY_RATE_LIMIT_BURST` | `60` | Per-peer token bucket burst capacity |
+| `REGISTRY_MAX_INSTANCES_PER_AGENT` | `0` | Maximum active instances per logical agent; `0` is unlimited |
+| `REGISTRY_MAX_ACTIVE_INSTANCES` | `0` | Registry-wide active-instance quota; `0` is unlimited |
 | `REGISTRY_UI` / `REGISTRY_ENABLE_UI` | `false` | Serve the built web dashboard |
 | `REGISTRY_UI_DIR` | package `ui/dist` | Static dashboard build directory |
 | `ETCD_ENDPOINT` | `http://localhost:2379` | etcd v3 JSON gateway |
@@ -337,17 +353,17 @@ For production, enable etcd authentication and TLS, use a dedicated least-privil
 - Put TLS and an identity-aware proxy/API gateway in front of the server. A shared write token is not a replacement for OAuth2, workload identity, or mTLS.
 - Active health checks intentionally fetch or connect to registered endpoints when configured; restrict registration access and network egress to trusted agents to manage SSRF risk.
 - Agent Cards are public discovery metadata. Do not place credentials or internal secrets in them.
-- Signed Agent Cards are preserved but signature verification and trust policy are deployment-specific and are not performed yet.
+- Signed Agent Cards are preserved unchanged. Verification status is recorded separately using the configured issuer, JWK, and `jku` trust policy.
 
 ## What to add next
 
 1. **Identity and policy:** OIDC/mTLS identities, tenant namespaces, RBAC, admission policy, and audit events. Bind the authenticated identity to the registered agent ID.
-2. **Trust:** verify A2A Agent Card JWS signatures, restrict `jku` origins, maintain trusted issuers/keys, and record verification status without modifying the signed card.
+2. ~~**Trust:** verify A2A Agent Card JWS signatures, restrict `jku` origins, maintain trusted issuers/keys, and record verification status without modifying the signed card.~~
 3. **Active health checks:** add gRPC health probes and richer check policies; HTTP/TCP probes and passing/warning/critical state reporting are available now and remain separate from TTL heartbeats.
 4. **Watch API:** add a native etcd watch/gRPC stream for lower-latency cross-replica delivery; the current SSE endpoint provides revisioned snapshots and works with both memory and etcd stores.
 5. **Locality-aware resolution:** add first-class zone/region/weight fields, health-aware selection, and optional client-side round-robin helpers. Until then these values can be carried in per-instance metadata.
 6. **Consul adapter:** use Consul sessions/TTL checks and KV/catalog metadata when an organization already operates Consul.
-7. **Operations:** OpenTelemetry traces, labeled/rate metrics with bounded cardinality, rate limiting, quotas, backups, chaos tests, and SLO dashboards.
+7. ~~**Operations:** OpenTelemetry traces, labeled/rate metrics with bounded cardinality, rate limiting, quotas, backups, chaos tests, and SLO dashboards.~~
 8. **Governance:** moderation/approval workflows, metadata schemas, retention, version compatibility policy, and a documented response to compromised registrations.
 
 ## Development
@@ -355,6 +371,8 @@ For production, enable etcd authentication and TLS, use a dedicated least-privil
 ```bash
 npm run check
 npm test
+# Include concurrent admission tests against a running etcd v3 gateway:
+ETCD_TEST_ENDPOINT=http://127.0.0.1:2379 npm test
 npm run build
 ```
 

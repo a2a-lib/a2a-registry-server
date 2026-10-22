@@ -32,6 +32,22 @@ export interface HealthStatus {
   error?: string;
 }
 
+/** Result of validating the signed Agent Card against the configured trust policy. */
+export interface AgentCardTrust {
+  /** verified when at least one JWS signature passes the trust policy. */
+  status: "verified" | "unverified" | "invalid";
+  /** ISO 8601 timestamp when the successful verification was recorded. */
+  verifiedAt?: string;
+  /** Protected-header issuer accepted by the configured issuer allowlist. */
+  issuer?: string;
+  /** Protected-header key identifier used for the successful signature. */
+  keyId?: string;
+  /** JWK Set URL used for the successful signature, when applicable. */
+  jku?: string;
+  /** Bounded reason code for an unsigned or rejected card. */
+  reason?: string;
+}
+
 /** One independently leased runtime instance of a logical agent. */
 export interface AgentInstance {
   /** Unique identifier of the instance. */
@@ -66,6 +82,8 @@ export interface RegisteredAgent {
   name: string;
   /** Published A2A Agent Card metadata. */
   agentCard: AgentCard;
+  /** Verification result for the published Agent Card, kept separate from the signed card. */
+  agentCardTrust: AgentCardTrust;
   /** Active instances contributing to this logical agent. */
   instances: AgentInstance[];
   /** Total number of active instances for this logical agent. */
@@ -100,6 +118,8 @@ export interface StoredAgent extends AgentInstance {
   name: string;
   /** Published A2A Agent Card. */
   agentCard: AgentCard;
+  /** Verification result for the published Agent Card, kept separate from the signed card. */
+  agentCardTrust?: AgentCardTrust;
   /** SHA-256 hash of the secret lease token needed for updates. */
   leaseTokenHash: string;
   /** Optional backend store lease identifier (e.g., etcd lease ID). */
@@ -171,6 +191,12 @@ export interface RegistryEvent {
   timestamp: string;
 }
 
+/** Active instance limits; zero disables a limit. */
+export interface InstanceQuotas {
+  maxInstancesPerAgent: number;
+  maxActiveInstances: number;
+}
+
 /** Abstract interface for storage backends (e.g. Memory, etcd). */
 export interface RegistryStore {
   /** Human-readable identifier for the storage backend implementation. */
@@ -185,8 +211,8 @@ export interface RegistryStore {
   get(id: string, instanceId: string): Promise<StoredAgent | undefined>;
   /** List all active agent instances in the store. */
   list(): Promise<StoredAgent[]>;
-  /** Insert or overwrite a stored agent instance record. */
-  put(agent: StoredAgent): Promise<void>;
+  /** Insert or overwrite a record. Enforce supplied quotas atomically with the write, across all store clients. */
+  put(agent: StoredAgent, quotas?: InstanceQuotas): Promise<void>;
   /** Update a stored record without extending its backend lease. */
   update(agent: StoredAgent): Promise<void>;
   /** Renew the lease for an existing stored agent instance record. */

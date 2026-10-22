@@ -6,6 +6,8 @@ import type { RegistryConfig } from "./config.js";
 import { isRegistryError, RegistryError } from "./errors.js";
 import { createLogger, type Logger } from "./logger.js";
 import { DEFAULT_INSTANCE_ID, RegistryService } from "./service.js";
+import { TokenBucketLimiter } from "./limits.js";
+import { finishHttpSpan, startHttpSpan } from "./telemetry.js";
 import { parseAgentQuery, parseRegistration, validateId, validateInstanceId } from "./validation.js";
 import { SERVER_VERSION } from "./version.js";
 
@@ -35,15 +37,70 @@ interface RequestContext {
   requestId: string;
   /** Timestamp when request handling started (ms). */
   startedAt: number;
+  pathname?: string;
 }
 
-/** In-memory Prometheus metrics counter tracker. */
+const HTTP_DURATION_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10];
+
+/** Keep metric labels bounded and safe for Prometheus exposition. */
+function metricLabel(value: string): string {
+  return value.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"").replaceAll("\n", "\\n");
+}
+
+/** Map a request path to one of the fixed route labels used by metrics and traces. */
+function routeLabel(pathname: string): string {
+  if (pathname === "/" || pathname === "/v1") return "/v1";
+  if (pathname === "/v1/agents" || pathname === "/v1/registry" || pathname === "/v1/registry/agents") return "/v1/agents";
+  if (pathname === "/v1/watch") return "/v1/watch";
+  if (pathname === "/v1/registry/register") return "/v1/registry/register";
+  if (pathname === "/v1/registry/heartbeat") return "/v1/registry/heartbeat";
+  if (pathname === "/admin/backup") return "/admin/backup";
+  if (pathname === "/health" || pathname === "/health/live" || pathname === "/health/ready") return pathname;
+  if (pathname === "/metrics" || pathname === "/openapi.yaml") return pathname;
+  if (/^\/v1\/agents\/[^/]+\/instances\/[^/]+\/heartbeat$/u.test(pathname)) return "/v1/agents/:id/instances/:instanceId/heartbeat";
+  if (/^\/v1\/agents\/[^/]+\/instances\/[^/]+$/u.test(pathname)) return "/v1/agents/:id/instances/:instanceId";
+  if (/^\/v1\/agents\/[^/]+\/instances$/u.test(pathname)) return "/v1/agents/:id/instances";
+  if (/^\/v1\/agents\/[^/]+\/heartbeat$/u.test(pathname)) return "/v1/agents/:id/heartbeat";
+  if (/^\/v1\/(?:registry\/)?agents\/[^/]+$/u.test(pathname)) return "/v1/agents/:id";
+  return "/other";
+}
+
+function methodLabel(method: string | undefined): string {
+  return method === "GET" || method === "POST" || method === "PUT" || method === "DELETE" || method === "OPTIONS"
+    ? method
+    : "OTHER";
+}
+
+function statusClass(status: number): string {
+  if (status >= 200 && status < 300) return "2xx";
+  if (status >= 300 && status < 400) return "3xx";
+  if (status >= 400 && status < 500) return "4xx";
+  return "5xx";
+}
+
+/** In-memory Prometheus metrics tracker with fixed route/method/status labels. */
 class Metrics {
   requests = 0;
   errors = 0;
   registrations = 0;
   heartbeats = 0;
   unregistrations = 0;
+  rateLimited = 0;
+  readonly #requestsByRoute = new Map<string, number>();
+  readonly #durationByRoute = new Map<string, number[]>();
+  readonly #durationSumByRoute = new Map<string, number>();
+
+  observe(method: string | undefined, pathname: string, status: number, durationMs: number): void {
+    const key = `${methodLabel(method)}\u0000${routeLabel(pathname)}\u0000${statusClass(status)}`;
+    this.#requestsByRoute.set(key, (this.#requestsByRoute.get(key) ?? 0) + 1);
+    const buckets = this.#durationByRoute.get(key) ?? HTTP_DURATION_BUCKETS.map(() => 0);
+    const seconds = durationMs / 1000;
+    for (let index = 0; index < HTTP_DURATION_BUCKETS.length; index += 1) {
+      if (seconds <= HTTP_DURATION_BUCKETS[index]!) buckets[index] = (buckets[index] ?? 0) + 1;
+    }
+    this.#durationByRoute.set(key, buckets);
+    this.#durationSumByRoute.set(key, (this.#durationSumByRoute.get(key) ?? 0) + seconds);
+  }
 
   /** Render metrics in Prometheus text format (version 0.0.4). */
   render(storeName: string): string {
@@ -63,7 +120,30 @@ class Metrics {
       "# HELP a2a_registry_unregistrations_total Successful unregistrations.",
       "# TYPE a2a_registry_unregistrations_total counter",
       `a2a_registry_unregistrations_total ${this.unregistrations}`,
-      `a2a_registry_store_info{store="${storeName}"} 1`,
+      "# HELP a2a_registry_http_requests_rate_limited_total Requests rejected by the token bucket limiter.",
+      "# TYPE a2a_registry_http_requests_rate_limited_total counter",
+      `a2a_registry_http_requests_rate_limited_total ${this.rateLimited}`,
+      "# HELP a2a_registry_http_requests_by_route_total HTTP requests by fixed route, method, and status class.",
+      "# TYPE a2a_registry_http_requests_by_route_total counter",
+      ...[...this.#requestsByRoute.entries()].map(([key, value]) => {
+        const [method, route, status] = key.split("\u0000");
+        return `a2a_registry_http_requests_by_route_total{method="${metricLabel(method ?? "OTHER")}",route="${metricLabel(route ?? "/other")}",status_class="${status ?? "5xx"}"} ${value}`;
+      }),
+      "# HELP a2a_registry_http_request_duration_seconds HTTP request duration by fixed route, method, and status class.",
+      "# TYPE a2a_registry_http_request_duration_seconds histogram",
+      ...[...this.#durationByRoute.entries()].flatMap(([key, buckets]) => {
+        const [method, route, status] = key.split("\u0000");
+        const labels = `method="${metricLabel(method ?? "OTHER")}",route="${metricLabel(route ?? "/other")}",status_class="${status ?? "5xx"}"`;
+        const lines = HTTP_DURATION_BUCKETS.map((bucket, index) =>
+          `a2a_registry_http_request_duration_seconds_bucket{${labels},le="${bucket}"} ${buckets[index] ?? 0}`,
+        );
+        const total = this.#requestsByRoute.get(key) ?? 0;
+        lines.push(`a2a_registry_http_request_duration_seconds_bucket{${labels},le="+Inf"} ${total}`);
+        lines.push(`a2a_registry_http_request_duration_seconds_count{${labels}} ${this.#requestsByRoute.get(key) ?? 0}`);
+        lines.push(`a2a_registry_http_request_duration_seconds_sum{${labels}} ${this.#durationSumByRoute.get(key) ?? 0}`);
+        return lines;
+      }),
+      `a2a_registry_store_info{store="${metricLabel(storeName)}"} 1`,
       "",
     ].join("\n");
   }
@@ -180,7 +260,7 @@ async function serveUi(req: IncomingMessage, res: ServerResponse, config: Regist
 /** Paths that must retain API/system 404 semantics instead of falling back to the SPA. */
 function isReservedServerPath(pathname: string): boolean {
   return pathname === "/v1" || pathname.startsWith("/v1/") || [
-    "/health", "/health/live", "/health/ready", "/metrics", "/openapi.yaml",
+    "/health", "/health/live", "/health/ready", "/metrics", "/openapi.yaml", "/admin/backup",
   ].includes(pathname);
 }
 
@@ -195,6 +275,16 @@ function bearer(req: IncomingMessage): string | undefined {
 function leaseToken(req: IncomingMessage): string | undefined {
   const value = req.headers["x-registry-lease-token"];
   return Array.isArray(value) ? value[0] : value;
+}
+
+/** Use the socket peer address as a stable, non-user-controlled rate-limit identity. */
+function clientIdentity(req: IncomingMessage): string {
+  return req.socket.remoteAddress ?? "unknown";
+}
+
+/** Limit API/admin traffic while leaving liveness, readiness, and metrics scrape paths available. */
+function shouldRateLimit(pathname: string): boolean {
+  return pathname.startsWith("/v1/") || pathname === "/v1" || pathname.startsWith("/admin/");
 }
 
 /** Extract and decode agent ID from single-agent route paths (e.g. `/v1/agents/:id`). */
@@ -262,6 +352,7 @@ function instanceLocation(id: string, instanceId: string): string {
 /** Build the public server metadata payload used by the dashboard and API clients. */
 function serverInfo(config: RegistryConfig, service: RegistryService, ready: boolean): Record<string, unknown> {
   const baseUrl = config.publicUrl.replace(/\/$/u, "");
+  const trust = config.trust ?? { required: false };
   return {
     name: "A2A Registry Server",
     version: SERVER_VERSION,
@@ -277,6 +368,11 @@ function serverInfo(config: RegistryConfig, service: RegistryService, ready: boo
       readiness: "/health/ready",
       metrics: "/metrics",
       watch: "/v1/watch",
+      ...(config.backupToken ? { backup: "/admin/backup" } : {}),
+    },
+    trust: {
+      required: trust.required,
+      statusField: "agentCardTrust",
     },
   };
 }
@@ -366,12 +462,18 @@ export function createRegistryHttpServer(
   logger: Logger = createLogger(config.logLevel),
 ): Server {
   const metrics = new Metrics();
+  const rateLimitRequestsPerMinute = config.rateLimitRequestsPerMinute ?? 0;
+  const rateLimiter = rateLimitRequestsPerMinute > 0
+    ? new TokenBucketLimiter(rateLimitRequestsPerMinute, config.rateLimitBurst ?? 60)
+    : undefined;
   return createServer(async (req, res) => {
     const context: RequestContext = {
       requestId: (Array.isArray(req.headers["x-request-id"]) ? req.headers["x-request-id"][0] : req.headers["x-request-id"]) ?? crypto.randomUUID(),
       startedAt: Date.now(),
     };
     const requestLogger = logger.child({ requestId: context.requestId });
+    let requestSpan: ReturnType<typeof startHttpSpan> | undefined;
+    let requestError: unknown;
     metrics.requests += 1;
     setCommonHeaders(res, config, context.requestId);
 
@@ -383,6 +485,17 @@ export function createRegistryHttpServer(
       }
 
       const url = new URL(req.url ?? "/", config.publicUrl);
+      context.pathname = url.pathname;
+      requestSpan = startHttpSpan(methodLabel(req.method), routeLabel(url.pathname), context.requestId);
+      if (rateLimiter && shouldRateLimit(url.pathname)) {
+        const decision = rateLimiter.consume(clientIdentity(req));
+        if (!decision.allowed) {
+          metrics.rateLimited += 1;
+          throw new RegistryError(429, "rate_limit_exceeded", "Request rate limit exceeded", {
+            retryAfterSeconds: decision.retryAfterSeconds,
+          });
+        }
+      }
       const privileged = config.writeToken !== undefined && bearer(req) !== undefined &&
         constantEquals(bearer(req) as string, config.writeToken);
 
@@ -426,6 +539,19 @@ export function createRegistryHttpServer(
         const body = metrics.render(service.storeName);
         res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" });
         res.end(body);
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/admin/backup") {
+        if (!config.backupToken) throw new RegistryError(404, "route_not_found", "Route not found");
+        if (!constantEquals(bearer(req) ?? "", config.backupToken)) {
+          throw new RegistryError(401, "backup_auth_required", "A valid bearer token is required to export a registry backup");
+        }
+        const snapshot = await service.exportSnapshot();
+        json(res, 200, snapshot, {
+          "Cache-Control": "no-store",
+          "Content-Disposition": `attachment; filename="a2a-registry-backup.json"`,
+        });
         return;
       }
 
@@ -602,6 +728,7 @@ export function createRegistryHttpServer(
 
       throw new RegistryError(404, "route_not_found", "Route not found");
     } catch (error) {
+      requestError = error;
       metrics.errors += 1;
       const registryError = isRegistryError(error)
         ? error
@@ -612,7 +739,13 @@ export function createRegistryHttpServer(
         status: registryError.status,
         detail: registryError.message,
         requestId: context.requestId,
-      }, { "Cache-Control": "no-store" });
+      }, {
+        "Cache-Control": "no-store",
+        ...(registryError.status === 429 && registryError.details && typeof registryError.details === "object" &&
+          typeof (registryError.details as { retryAfterSeconds?: unknown }).retryAfterSeconds === "number"
+          ? { "Retry-After": String((registryError.details as { retryAfterSeconds: number }).retryAfterSeconds) }
+          : {}),
+      });
       if (!isRegistryError(error)) {
         requestLogger.error({ event: "http.request.error", err: error }, "Unhandled request error");
       }
@@ -624,6 +757,8 @@ export function createRegistryHttpServer(
         status: res.statusCode,
         durationMs: Date.now() - context.startedAt,
       }, "Request completed");
+      metrics.observe(req.method, context.pathname ?? "/other", res.statusCode || 500, Date.now() - context.startedAt);
+      if (requestSpan) finishHttpSpan(requestSpan, res.statusCode || 500, requestError);
     }
   });
 }
